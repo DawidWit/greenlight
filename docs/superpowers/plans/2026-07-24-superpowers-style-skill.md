@@ -1506,6 +1506,19 @@ Replace `test_frontmatter_is_portable_and_discoverable` and add new tests in
             "was persisted, or listing only packet identity, is insufficient.",
             normalized,
         )
+
+    def test_pre_gate_head_move_refreshes_before_pending_decision(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Normal order: re-check the remote head SHA, build the current "
+            "`packet_identity`, persist the complete `pending_decisions` entry, "
+            "then show the gate. If this pre-gate SHA re-check finds a moved "
+            "head, do not persist `pending_decisions` or show the gate. First "
+            "refresh feedback, reconcile edits, and rerun verification; only "
+            "then build and persist a new current packet and pending decision "
+            "before displaying the gate.",
+            normalized,
+        )
 ```
 
 Replace the old mutation-boundary test with
@@ -1640,7 +1653,12 @@ all five fields: `question`, `options`, `recommendation`, `scope`, and
 pending decision or record was persisted, or listing only packet identity, is
 insufficient.
 
-Re-check the remote head SHA. Persist the pending decision, then show:
+Normal order: re-check the remote head SHA, build the current `packet_identity`,
+persist the complete `pending_decisions` entry, then show the gate. If this
+pre-gate SHA re-check finds a moved head, do not persist `pending_decisions` or
+show the gate. First refresh feedback, reconcile edits, and rerun verification;
+only then build and persist a new current packet and pending decision before
+displaying the gate.
 
 ```text
 HUMAN DECISION REQUIRED

@@ -141,6 +141,19 @@ class SkillContractTests(unittest.TestCase):
             normalized,
         )
 
+    def test_pre_gate_head_move_refreshes_before_pending_decision(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Normal order: re-check the remote head SHA, build the current "
+            "`packet_identity`, persist the complete `pending_decisions` entry, "
+            "then show the gate. If this pre-gate SHA re-check finds a moved "
+            "head, do not persist `pending_decisions` or show the gate. First "
+            "refresh feedback, reconcile edits, and rerun verification; only "
+            "then build and persist a new current packet and pending decision "
+            "before displaying the gate.",
+            normalized,
+        )
+
     def test_is_concise_and_has_no_template_placeholders(self):
         self.assertLess(len(self.lines), 500)
         self.assertNotIn("TODO", self.text)
