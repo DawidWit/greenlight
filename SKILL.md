@@ -103,10 +103,9 @@ Persist only summarized command results and evidence. Never store raw
 environment output, raw authentication output, authorization headers, cookies,
 credentials, or credential material in any key or value.
 Sensitive assignment and header checks apply only to true assignment/header
-lines. A safe sentinel such as `redacted` or `not available` must occupy the
-entire value after optional matching quotes; a safe word followed by any other
-content remains unsafe. Descriptive prose that merely mentions a token or
-password is allowed when it contains no credential-shaped value.
+lines, using shell names `[A-Za-z_][A-Za-z0-9_]*`. A safe sentinel must occupy
+the entire value after optional matching quotes; a safe word plus any suffix
+remains unsafe. Descriptive prose without credential-shaped values is allowed.
 
 ### Phase 5: Request Approval
 
@@ -128,17 +127,16 @@ missing files, paths outside the workspace, and unsupported file types.
 Before the approval fingerprint, require the real Git index to be empty. The
 working mode builds an immutable tree through a temporary Git index and never
 stages the real index.
+Remove ambient Git index and repository overrides for every real-index
+inspection; temporary-index mode sets only its own isolated index. The cleared
+overrides include `GIT_INDEX_FILE`, `GIT_DIR`, and `GIT_WORK_TREE`.
 
-The canonical fingerprint begins with `apply-pr-reviews-change-v1` followed by
-a NUL byte. For each lexically sorted included path, append five records in
-order: path (`P`), base file mode (`M`), base content (`B`), working file mode
-(`m`), and working content (`W`). Each record is its one-byte tag, an
-8-byte unsigned big-endian payload length, and the exact payload bytes. Use
-`missing` as the mode and empty content when one side is absent. It covers
-tracked changes, deletions, untracked files, and file mode changes, including
-executable bits and symlink target bytes. `diff_sha256` is the lowercase
-SHA-256 of those complete canonical bytes, not a prose summary or raw command
-output.
+The canonical fingerprint begins with `apply-pr-reviews-change-v1` plus a NUL
+byte. Each sorted path adds path (`P`), base mode/content (`M`/`B`), and snapshot
+mode/content (`m`/`W`); each mode is a Git file mode. Each record is a tag byte,
+an 8-byte unsigned big-endian payload length, and its bytes. `missing` with empty
+content marks an absent side. It covers tracked changes, deletions, untracked
+files, and symlinks. `diff_sha256` is SHA-256 of those bytes.
 
 Recompute the fingerprint from the recorded isolated workspace before trusting
 takeover evidence, showing approval, and publishing; any missing or mismatched
@@ -185,9 +183,6 @@ to exactly one choice label and its matching typed `outcome`.
 Store that linkage as
 `decision_history_index`. Approval objects have exactly `valid`,
 `packet_identity`, `decision_history_index`, `human_answer`, and `outcome`.
-This current-target comparison is the pre-commit rule; the authorized H-to-C
-lifecycle retains the H packet under the stricter Phase 6 commit and remote
-checks.
 
 ```text
 HUMAN DECISION REQUIRED
@@ -230,34 +225,57 @@ publication authority. This ordinary invalidation comparison applies before
 creating C; the validated lifecycle's recorded workspace and PR head transition
 from H to C does not alter or invalidate the retained H packet.
 
-If unchanged, stage only the included files and recompute with the same
-fingerprint arguments except:
-
-```text
-python3 <skill-directory>/scripts/context_store.py fingerprint \
-  <same packet arguments> --source index \
-  --file <included-file> [--file <included-file> ...]
-```
-
+If unchanged, stage only the included files in a sanitized Git environment.
 After approval, stage only the included files, fingerprint the real index, and
 require its complete packet identity to equal the approved packet before
-commit. The index mode rejects any extra staged path. Unstaged working-tree
-drift cannot silently change the staged snapshot, and the commit tree must be
-the immutable tree returned by the approved index fingerprint.
+commit. The index mode rejects every extra path; working-tree, hook, alternate
+index, and post-snapshot index mutations cannot change the immutable tree.
 
-Create the exact displayed commit C. Persist a `committed` checkpoint before
-push, retaining the approved pre-commit packet and decision while recording
-commit SHA C and workspace HEAD C. At this checkpoint, workspace base remains
-the approved head H, the PR head remains H, and `pushed_sha` and `published_at`
-remain null. The checkpoint is valid only when C directly descends from H, has
-the exact message and included paths, and its tree reproduces the approved
-canonical fingerprint.
+```text
+python3 <skill-directory>/scripts/context_store.py commit-approved \
+  --repo <local-path> --pr <number> --expected-revision <revision>
+```
 
-Push normally to the displayed branch; never force-push. Re-check that the
-remote branch head is C. Only after the normal push and remote head re-check
-may the checkpoint become `pushed`, with pushed SHA and PR head both C. Retain
-the approved pre-commit H packet and exact decision in both lifecycle states;
-record checks and remaining decisions without replacing that audit evidence.
+`commit-approved` is the only sanctioned runtime commit path; never run
+`git commit`. It requires the attached branch/H ref, fingerprints the sanitized
+real index with `--source index`, creates C from that tree and exact
+parent/message, compare-and-swap advances H to C, and persists under the PR
+lock. Persist a `committed` checkpoint before push, retaining the approved
+pre-commit packet and decision while recording commit SHA C and workspace HEAD C.
+
+```text
+python3 <skill-directory>/scripts/context_store.py push-approved \
+  --repo <local-path> --pr <number> --expected-revision <revision> \
+  --remote-name <configured-name> --remote-url <exact-configured-url>
+```
+
+`push-approved` is the only sanctioned push and pushed-state transition. It
+uses `git ls-remote` against the configured URL. The command verifies remote H,
+performs one normal non-force push of C to the exact branch, re-reads the remote
+ref, and persists `pushed` only when it equals C. Only after the normal push and
+remote head re-check may the checkpoint become `pushed`, with pushed SHA and PR
+head both C. Initialization and ordinary JSON updates cannot create any
+publication checkpoint.
+
+A moved remote is recorded without attempting a push, invalidates authority,
+and enters reconciliation with the observed remote SHA. A rejected push becomes
+`push-failed`; a pre-push move becomes `superseded`. Both retain C and the old
+packet but cannot authorize another push.
+
+After `pushed`, `superseded`, or `push-failed`, refresh a workspace at the
+verified remote head and run:
+
+```text
+python3 <skill-directory>/scripts/context_store.py start-cycle \
+  --repo <local-path> --pr <number> --expected-revision <revision> \
+  --workspace <refreshed-path> --workspace-kind <worktree-or-clone> \
+  --head-sha <verified-remote-head>
+```
+
+`start-cycle` is the only sanctioned reset after a terminal publication; it
+archives the terminal record, increments the cycle, and installs only a
+validated refreshed workspace/head. Never clear state, reuse recovery, rebase
+C, retry a stale push, or use force-with-lease to start a later cycle.
 
 Do not reply to review threads, resolve review threads, post comments, approve,
 merge, or close the PR.
@@ -377,10 +395,10 @@ must supply the expected revision. On a revision conflict or lock, stop the
 affected PR, reload, reconcile, and retry. Never break a lock automatically.
 
 Every complete state document has these top-level fields:
-`schema_version` (currently `3`), `revision`, `repository`, `pull_request`,
+`schema_version` (currently `4`), `revision`, `cycle_id`, `repository`, `pull_request`,
 `workspace`, `phase`, `status`, `review_ledger`, `changes`, `verification`,
-`pending_decisions`, `decision_history`, `approval`, `publication`, and
-`updated_at`.
+`pending_decisions`, `decision_history`, `approval`, `publication`,
+`publication_history`, and `updated_at`.
 
 `repository` contains `name_with_owner` and the configured `local_path`.
 `pull_request` contains `number`, `url`, `base_branch`, `head_repository`,
@@ -400,57 +418,52 @@ Each decision-history entry contains `revision`, `timestamp`, `decision_type`,
 `evidence`, `options`, `recommendation`, `answer`, `scope`, `transition`,
 `packet_identity`, `question`, `outcome`, and `recovery`. A publish decision
 requires the exact packet, question, canonical options, answer, and matching
-typed outcome. Publication has exactly `status`, `commit_sha`, `pushed_sha`,
-`packet_identity`,
-`approval_decision_history_index`, `checks`, and `published_at`, and links to
-the same publish decision. `status` is `committed` or `pushed`; its nullable
-fields and workspace/PR SHA relationships follow Phase 6. Keep decision
-history append-only.
-
-Persist after classification, baseline, each verified batch, before and after a
-human decision, before approval, after head invalidation, and after commit,
-push, failure, or intentional stop.
+typed outcome. Publication records cycle, status, commit/push SHAs, packet/link,
+checks, timestamps, configured remote identity, and observed remote SHA. Status
+is `committed`, `pushed`, `superseded`, or `push-failed`. Keep decision history
+and `publication_history` append-only; only `start-cycle` increments or archives
+the cycle.
 
 The ledger is handoff evidence, not authority to bypass verification.
 
 ## Review Disposition Reference
 
-| State | Action |
-|---|---|
-| Current and actionable | Implement and verify. |
-| Resolved | Verify it remains addressed; do not redo it. |
-| Outdated | Map the concern to current code; apply only if relevant. |
-| Duplicate | Implement once and associate every duplicate. |
-| Already addressed | Record current code or commit as evidence. |
-| Superseded | Follow the latest explicit reviewer or author decision. |
-| Conflicting or ambiguous | Use the Human Decision Gate. |
-| Incorrect, harmful, or out of scope | Skip with technical evidence. |
+| State                               | Action                                                   |
+| ----------------------------------- | -------------------------------------------------------- |
+| Current and actionable              | Implement and verify.                                    |
+| Resolved                            | Verify it remains addressed; do not redo it.             |
+| Outdated                            | Map the concern to current code; apply only if relevant. |
+| Duplicate                           | Implement once and associate every duplicate.            |
+| Already addressed                   | Record current code or commit as evidence.               |
+| Superseded                          | Follow the latest explicit reviewer or author decision.  |
+| Conflicting or ambiguous            | Use the Human Decision Gate.                             |
+| Incorrect, harmful, or out of scope | Skip with technical evidence.                            |
 
 ## Common Rationalizations
 
-| Excuse | Reality |
-|---|---|
-| "A local commit is not publishing." | Staging and committing are beyond the approval boundary. |
-| "The user asked to update PRs." | That does not authorize comments, resolution, approval, merge, or close. |
-| "The tests mostly pass." | Show exact evidence and any pre-existing failures. |
-| "The head only moved slightly." | Any SHA change invalidates the packet. |
-| "The reviewer requested it." | Verify suggestions against current code. |
-| "The previous agent decided." | Reuse evidence; revalidate changed assumptions. |
-| "My memory is newer." | The on-disk revision wins; reload before writing. |
+| Excuse                              | Reality                                                                  |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| "A local commit is not publishing." | Staging and committing are beyond the approval boundary.                 |
+| "The user asked to update PRs."     | That does not authorize comments, resolution, approval, merge, or close. |
+| "The tests mostly pass."            | Show exact evidence and any pre-existing failures.                       |
+| "The head only moved slightly."     | Any SHA change invalidates the packet.                                   |
+| "The reviewer requested it."        | Verify suggestions against current code.                                 |
+| "The previous agent decided."       | Reuse evidence; revalidate changed assumptions.                          |
+| "My memory is newer."               | The on-disk revision wins; reload before writing.                        |
 
 ## Quick Reference
 
-| Situation | Required action |
-|---|---|
-| Missing repository configuration | Human Decision Gate for local paths |
-| Ambiguous or conflicting feedback | Persist and show Human Decision Gate |
-| Dirty configured checkout | Use isolated work; never alter the checkout |
-| Existing context | Load, compare SHA, and revalidate |
-| Revision conflict | Reload and reconcile |
-| Introduced test failure | Revise or remove the edit |
-| Blocking pre-existing failure | Persist and show Human Decision Gate |
-| Ready to publish | Persist and show exact approval packet |
-| Head moved | Invalidate approval and verify again |
+| Situation                         | Required action                             |
+| --------------------------------- | ------------------------------------------- |
+| Missing repository configuration  | Human Decision Gate for local paths         |
+| Ambiguous or conflicting feedback | Persist and show Human Decision Gate        |
+| Dirty configured checkout         | Use isolated work; never alter the checkout |
+| Existing context                  | Load, compare SHA, and revalidate           |
+| Revision conflict                 | Reload and reconcile                        |
+| Introduced test failure           | Revise or remove the edit                   |
+| Blocking pre-existing failure     | Persist and show Human Decision Gate        |
+| Ready to publish                  | Persist and show exact approval packet      |
+| Head moved                        | Invalidate approval and verify again        |
 
 ## Red Flags - STOP
 
@@ -470,15 +483,15 @@ The ledger is handoff evidence, not authority to bypass verification.
 
 ## Common Mistakes
 
-| Mistake | Correction |
-|---|---|
-| Asking for `owner/repository` | Ask once for local repository directories. |
-| Treating all comments as current | Re-evaluate concerns against current code. |
-| Committing before approval | Keep the verified diff unstaged. |
-| Asking about routine choices | Decide routine implementation locally. |
-| Hiding a needed decision in prose | Use the exact Human Decision Gate. |
-| Trusting stale context | Compare SHA and revalidate evidence. |
-| Cleaning a user checkout | Work in isolation. |
+| Mistake                           | Correction                                 |
+| --------------------------------- | ------------------------------------------ |
+| Asking for `owner/repository`     | Ask once for local repository directories. |
+| Treating all comments as current  | Re-evaluate concerns against current code. |
+| Committing before approval        | Keep the verified diff unstaged.           |
+| Asking about routine choices      | Decide routine implementation locally.     |
+| Hiding a needed decision in prose | Use the exact Human Decision Gate.         |
+| Trusting stale context            | Compare SHA and revalidate evidence.       |
+| Cleaning a user checkout          | Work in isolation.                         |
 
 ## The Bottom Line
 

@@ -85,7 +85,7 @@ def valid_state(
             else "a" * 40
         )
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "revision": revision,
         "repository": {
             "name_with_owner": "acme/widgets",
@@ -119,6 +119,8 @@ def valid_state(
         "decision_history": [],
         "approval": None,
         "publication": None,
+        "cycle_id": 1,
+        "publication_history": [],
         "updated_at": "2026-07-24T12:00:00Z",
     }
 
@@ -402,6 +404,8 @@ class SchemaTests(unittest.TestCase):
     def test_rejects_sensitive_string_values_but_allows_safe_summaries(self):
         sensitive_values = (
             "PATH=/usr/local/bin\nHOME=/Users/example\nSHELL=/bin/zsh",
+            "X=actual-secret",
+            "lowercase_name=actual-secret",
             "TOKEN=actual-secret-material-1234567890",
             "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
             "github_pat_11AA0_examplecredentialmaterial",
@@ -436,6 +440,8 @@ class SchemaTests(unittest.TestCase):
                     "Handle token: actual-secret in parser",
                     "TOKEN=redacted",
                     "TOKEN='redacted'",
+                    "X=redacted",
+                    "lowercase_name=\"not-set\"",
                     "No raw authentication or environment output was stored.",
                 ],
             }
@@ -709,12 +715,17 @@ class SchemaTests(unittest.TestCase):
         state["pull_request"]["head_sha"] = "c" * 40
         state["publication"] = {
             "status": "pushed",
+            "cycle_id": 1,
             "commit_sha": "c" * 40,
             "pushed_sha": "c" * 40,
             "packet_identity": packet,
             "approval_decision_history_index": 0,
             "checks": ["python3 -m unittest: 52 tests passed"],
             "published_at": "2026-07-24T12:10:00Z",
+            "finalized_at": "2026-07-24T12:10:00Z",
+            "remote_name": "origin",
+            "remote_url": "https://github.com/acme/widgets.git",
+            "observed_remote_sha": "c" * 40,
         }
         self.assertIs(context_store.validate_state(state, 17), state)
 
@@ -811,6 +822,25 @@ class SchemaTests(unittest.TestCase):
 
 
 class MutationTests(unittest.TestCase):
+    def test_ordinary_update_cannot_change_publication_cycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            context_store.initialize_state(repository, 17, initial)
+            forged_cycle = valid_state(
+                revision=1,
+                local_path=str(repository.resolve()),
+            )
+            forged_cycle["cycle_id"] = 2
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(
+                    repository,
+                    17,
+                    0,
+                    forged_cycle,
+                )
+
     @unittest.skipIf(os.name == "nt", "symlink behavior varies on Windows")
     def test_initialize_never_replaces_dangling_state_symlink(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1308,6 +1338,37 @@ class FingerprintTests(unittest.TestCase):
                     ["tracked.txt", "deleted.txt", "untracked.txt"],
                 )
 
+    def test_working_fingerprint_ignores_hostile_ambient_index_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            (repository / "unrelated.txt").write_text(
+                "unrelated\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "unrelated.txt"],
+                check=True,
+            )
+            alternate_index = Path(directory, "alternate.index")
+            hostile_environment = os.environ.copy()
+            hostile_environment["GIT_INDEX_FILE"] = str(alternate_index)
+            subprocess.run(
+                ["git", "-C", str(repository), "read-tree", base_sha],
+                check=True,
+                env=hostile_environment,
+            )
+
+            with patch.dict(
+                os.environ,
+                {"GIT_INDEX_FILE": str(alternate_index)},
+            ):
+                with self.assertRaises(context_store.StateValidationError):
+                    self.compute(
+                        repository,
+                        base_sha,
+                        ["tracked.txt", "deleted.txt", "untracked.txt"],
+                    )
+
     def test_working_fingerprint_uses_immutable_temporary_index_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             repository, base_sha = self.create_changed_workspace(directory)
@@ -1405,8 +1466,785 @@ class FingerprintTests(unittest.TestCase):
                     source="index",
                 )
 
+    def test_staged_fingerprint_ignores_hostile_ambient_index_override(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            files = ["tracked.txt", "deleted.txt", "untracked.txt"]
+            approved = self.compute(repository, base_sha, files)
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "-A", "--", *files],
+                check=True,
+            )
+            alternate_index = Path(directory, "alternate.index")
+            hostile_environment = os.environ.copy()
+            hostile_environment["GIT_INDEX_FILE"] = str(alternate_index)
+            subprocess.run(
+                ["git", "-C", str(repository), "read-tree", base_sha],
+                check=True,
+                env=hostile_environment,
+            )
+
+            with patch.dict(
+                os.environ,
+                {"GIT_INDEX_FILE": str(alternate_index)},
+            ):
+                staged = self.compute(
+                    repository,
+                    base_sha,
+                    files,
+                    source="index",
+                )
+
+            self.assertEqual(
+                staged["packet_identity"],
+                approved["packet_identity"],
+            )
+
 
 class PublicationLifecycleTests(unittest.TestCase):
+    def prepare_approved_index(self, directory):
+        repository = create_git_repository(directory)
+        subprocess.run(
+            ["git", "-C", str(repository), "branch", "-M", "feature/parser"],
+            check=True,
+        )
+        (repository / "tracked.txt").write_text("before\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-q", "-m", "Base"],
+            check=True,
+        )
+        base_sha = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repository / "tracked.txt").write_text("after\n", encoding="utf-8")
+        (repository / "new.txt").write_text("new\n", encoding="utf-8")
+        files = ["new.txt", "tracked.txt"]
+        fingerprint = context_store.compute_packet_identity(
+            workspace_path=repository,
+            workspace_kind="worktree",
+            base_sha=base_sha,
+            head_repository="acme/widgets",
+            head_branch="feature/parser",
+            head_sha=base_sha,
+            commit_message="Apply exact review fixes",
+            included_files=files,
+            source="working",
+        )
+        state = valid_state(local_path=str(repository), head_sha=base_sha)
+        state["workspace"] = fingerprint["workspace"]
+        state["changes"].update(
+            {
+                "files": files,
+                "summary": "Update tracked parser data and add coverage.",
+                "diff_sha256": fingerprint["packet_identity"]["diff_sha256"],
+                "commit_message": "Apply exact review fixes",
+            }
+        )
+        approve_state(state)
+        context_store.initialize_state(repository, 17, state)
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "-A", "--", *files],
+            check=True,
+        )
+        return repository, base_sha, fingerprint
+
+    def test_commit_approved_creates_exact_index_tree_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, approved = self.prepare_approved_index(
+                directory
+            )
+
+            result = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+
+            committed = result["state"]
+            commit_sha = result["commit_sha"]
+            self.assertEqual(result["operation"], "commit-approved")
+            self.assertEqual(committed["publication"]["status"], "committed")
+            self.assertEqual(committed["publication"]["commit_sha"], commit_sha)
+            self.assertEqual(committed["workspace"]["head_sha"], commit_sha)
+            self.assertEqual(committed["pull_request"]["head_sha"], base_sha)
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD^"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                base_sha,
+            )
+            self.assertEqual(
+                subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                result["snapshot_tree"],
+            )
+            self.assertEqual(
+                committed["approval"]["packet_identity"],
+                approved["packet_identity"],
+            )
+
+    def test_commit_approved_ignores_ambient_index_and_does_not_run_hooks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, approved = self.prepare_approved_index(
+                directory
+            )
+            alternate_index = Path(directory, "alternate.index")
+            hostile_environment = os.environ.copy()
+            hostile_environment["GIT_INDEX_FILE"] = str(alternate_index)
+            subprocess.run(
+                ["git", "-C", str(repository), "read-tree", base_sha],
+                check=True,
+                env=hostile_environment,
+            )
+            hook_marker = Path(directory, "hook-ran")
+            hook = repository / ".git" / "hooks" / "pre-commit"
+            hook.write_text(
+                f"#!/bin/sh\ntouch '{hook_marker}'\nexit 1\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+
+            with patch.dict(
+                os.environ,
+                {"GIT_INDEX_FILE": str(alternate_index)},
+            ):
+                result = context_store.commit_approved_state(
+                    repository,
+                    17,
+                    expected_revision=0,
+                )
+
+            self.assertFalse(hook_marker.exists())
+            self.assertEqual(
+                result["state"]["publication"]["packet_identity"],
+                approved["packet_identity"],
+            )
+
+    def test_commit_approved_rejects_wrong_head_and_index_inputs(self):
+        scenarios = (
+            "detached",
+            "wrong-branch",
+            "changed-ref",
+            "extra-index",
+            "drifted-index",
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                with tempfile.TemporaryDirectory() as directory:
+                    repository, base_sha, _ = self.prepare_approved_index(
+                        directory
+                    )
+                    expected_ref = base_sha
+                    if scenario == "detached":
+                        subprocess.run(
+                            ["git", "-C", str(repository), "checkout", "--detach"],
+                            check=True,
+                            capture_output=True,
+                        )
+                    elif scenario == "wrong-branch":
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "switch",
+                                "-c",
+                                "other-branch",
+                            ],
+                            check=True,
+                            capture_output=True,
+                        )
+                    elif scenario == "changed-ref":
+                        expected_ref = subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "commit-tree",
+                                f"{base_sha}^{{tree}}",
+                                "-p",
+                                base_sha,
+                                "-m",
+                                "Unexpected local move",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip()
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "update-ref",
+                                "refs/heads/feature/parser",
+                                expected_ref,
+                                base_sha,
+                            ],
+                            check=True,
+                        )
+                    elif scenario == "extra-index":
+                        (repository / "extra.txt").write_text(
+                            "extra\n",
+                            encoding="utf-8",
+                        )
+                        subprocess.run(
+                            ["git", "-C", str(repository), "add", "extra.txt"],
+                            check=True,
+                        )
+                    else:
+                        (repository / "tracked.txt").write_text(
+                            "drifted\n",
+                            encoding="utf-8",
+                        )
+                        subprocess.run(
+                            ["git", "-C", str(repository), "add", "tracked.txt"],
+                            check=True,
+                        )
+
+                    with self.assertRaises(context_store.StateValidationError):
+                        context_store.commit_approved_state(
+                            repository,
+                            17,
+                            expected_revision=0,
+                        )
+                    self.assertEqual(
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(repository),
+                                "rev-parse",
+                                "refs/heads/feature/parser",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip(),
+                        expected_ref,
+                    )
+
+    def test_commit_approved_supports_split_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, _, _ = self.prepare_approved_index(directory)
+            completed = subprocess.run(
+                ["git", "-C", str(repository), "update-index", "--split-index"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode != 0:
+                self.skipTest("Git split-index is unavailable")
+
+            result = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+
+            self.assertEqual(
+                result["state"]["publication"]["status"],
+                "committed",
+            )
+
+    def test_ordinary_update_cannot_claim_committed_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, _, _, commit_sha, approved = (
+                self.prepare_approved_commit(directory)
+            )
+            forged = self.committed_state(approved, commit_sha)
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(repository, 17, 0, forged)
+
+    def test_initialize_rejects_any_publication_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, _, _ = self.prepare_approved_index(directory)
+            committed = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )["state"]
+            state_path = (
+                context_store.state_directory(repository, 17) / "state.json"
+            )
+            state_path.unlink()
+            committed["revision"] = 0
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.initialize_state(repository, 17, committed)
+
+    def test_push_approved_verifies_remote_before_and_after_push(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, _ = self.prepare_approved_index(directory)
+            remote = Path(directory, "remote.git")
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "remote",
+                    "add",
+                    "origin",
+                    str(remote),
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{base_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            committed = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+
+            result = context_store.push_approved_state(
+                repository,
+                17,
+                expected_revision=1,
+                remote_name="origin",
+                remote_url=str(remote),
+            )
+
+            commit_sha = committed["commit_sha"]
+            self.assertEqual(result["operation"], "push-approved")
+            self.assertEqual(result["observed_before"], base_sha)
+            self.assertEqual(result["observed_after"], commit_sha)
+            self.assertEqual(result["state"]["publication"]["status"], "pushed")
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(remote),
+                        "rev-parse",
+                        "refs/heads/feature/parser",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                commit_sha,
+            )
+
+    def test_push_approved_records_superseded_without_pushing_moved_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, _ = self.prepare_approved_index(directory)
+            remote = Path(directory, "remote.git")
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{base_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            committed = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+            remote_sha = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "commit-tree",
+                    f"{base_sha}^{{tree}}",
+                    "-p",
+                    base_sha,
+                    "-m",
+                    "Remote move",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{remote_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            push_marker = Path(directory, "push-attempted")
+            hook = remote / "hooks" / "pre-receive"
+            hook.write_text(
+                f"#!/bin/sh\ntouch '{push_marker}'\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+
+            result = context_store.push_approved_state(
+                repository,
+                17,
+                expected_revision=1,
+                remote_name="origin",
+                remote_url=str(remote),
+            )
+
+            superseded = result["state"]
+            self.assertEqual(result["outcome"], "superseded")
+            self.assertEqual(result["observed_before"], remote_sha)
+            self.assertEqual(
+                superseded["publication"]["status"], "superseded"
+            )
+            self.assertEqual(
+                superseded["publication"]["observed_remote_sha"],
+                remote_sha,
+            )
+            self.assertEqual(
+                superseded["publication"]["commit_sha"],
+                committed["commit_sha"],
+            )
+            self.assertFalse(superseded["approval"]["valid"])
+            self.assertEqual(superseded["phase"], "reconcile")
+            self.assertEqual(
+                subprocess.run(
+                    [
+                        "git",
+                        "--git-dir",
+                        str(remote),
+                        "rev-parse",
+                        "refs/heads/feature/parser",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                remote_sha,
+            )
+            self.assertFalse(push_marker.exists())
+
+    def test_push_approved_records_failed_push_with_observed_remote(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, _ = self.prepare_approved_index(directory)
+            remote = Path(directory, "remote.git")
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{base_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            committed = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+            hook = remote / "hooks" / "pre-receive"
+            hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+
+            result = context_store.push_approved_state(
+                repository,
+                17,
+                expected_revision=1,
+                remote_name="origin",
+                remote_url=str(remote),
+            )
+
+            failed = result["state"]
+            self.assertEqual(result["outcome"], "push-failed")
+            self.assertEqual(result["observed_after"], base_sha)
+            self.assertEqual(
+                failed["publication"]["status"], "push-failed"
+            )
+            self.assertEqual(
+                failed["publication"]["observed_remote_sha"], base_sha
+            )
+            self.assertEqual(
+                failed["publication"]["commit_sha"],
+                committed["commit_sha"],
+            )
+            self.assertFalse(failed["approval"]["valid"])
+
+    def test_start_cycle_archives_pushed_publication_and_resets_current_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, _ = self.prepare_approved_index(directory)
+            remote = Path(directory, "remote.git")
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{base_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            committed = context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+            pushed = context_store.push_approved_state(
+                repository,
+                17,
+                expected_revision=1,
+                remote_name="origin",
+                remote_url=str(remote),
+            )
+
+            result = context_store.start_cycle(
+                repository,
+                17,
+                expected_revision=2,
+                workspace_path=repository,
+                workspace_kind="worktree",
+                head_sha=committed["commit_sha"],
+            )
+
+            state = result["state"]
+            self.assertEqual(result["operation"], "start-cycle")
+            self.assertEqual(result["archived_cycle_id"], 1)
+            self.assertEqual(state["cycle_id"], 2)
+            self.assertEqual(state["publication_history"], [pushed["state"]["publication"]])
+            self.assertIsNone(state["publication"])
+            self.assertIsNone(state["approval"])
+            self.assertEqual(state["pending_decisions"], [])
+            self.assertEqual(state["changes"]["files"], [])
+            self.assertEqual(
+                state["pull_request"]["head_sha"], committed["commit_sha"]
+            )
+            self.assertEqual(
+                state["workspace"]["base_sha"], committed["commit_sha"]
+            )
+
+    def test_start_cycle_after_superseded_uses_refreshed_remote_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, _ = self.prepare_approved_index(directory)
+            remote = Path(directory, "remote.git")
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{base_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+            remote_sha = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "commit-tree",
+                    f"{base_sha}^{{tree}}",
+                    "-p",
+                    base_sha,
+                    "-m",
+                    "Remote move",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{remote_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            terminal = context_store.push_approved_state(
+                repository,
+                17,
+                expected_revision=1,
+                remote_name="origin",
+                remote_url=str(remote),
+            )
+            refreshed = Path(directory, "refreshed")
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "-q",
+                    "--branch",
+                    "feature/parser",
+                    str(remote),
+                    str(refreshed),
+                ],
+                check=True,
+            )
+
+            result = context_store.start_cycle(
+                repository,
+                17,
+                expected_revision=2,
+                workspace_path=refreshed,
+                workspace_kind="clone",
+                head_sha=remote_sha,
+            )
+
+            self.assertEqual(
+                result["state"]["publication_history"],
+                [terminal["state"]["publication"]],
+            )
+            self.assertEqual(result["state"]["cycle_id"], 2)
+            self.assertEqual(result["state"]["pull_request"]["head_sha"], remote_sha)
+            self.assertEqual(result["state"]["workspace"]["path"], str(refreshed.resolve()))
+
+    def test_start_cycle_after_failed_push_preserves_failure_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha, _ = self.prepare_approved_index(directory)
+            remote = Path(directory, "remote.git")
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "remote", "add", "origin", str(remote)],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{base_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            context_store.commit_approved_state(
+                repository,
+                17,
+                expected_revision=0,
+            )
+            hook = remote / "hooks" / "pre-receive"
+            hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+            terminal = context_store.push_approved_state(
+                repository,
+                17,
+                expected_revision=1,
+                remote_name="origin",
+                remote_url=str(remote),
+            )
+            refreshed = Path(directory, "refreshed")
+            subprocess.run(
+                [
+                    "git",
+                    "clone",
+                    "-q",
+                    "--branch",
+                    "feature/parser",
+                    str(remote),
+                    str(refreshed),
+                ],
+                check=True,
+            )
+
+            result = context_store.start_cycle(
+                repository,
+                17,
+                expected_revision=2,
+                workspace_path=refreshed,
+                workspace_kind="clone",
+                head_sha=base_sha,
+            )
+
+            self.assertEqual(
+                result["state"]["publication_history"],
+                [terminal["state"]["publication"]],
+            )
+            self.assertEqual(
+                result["state"]["publication_history"][0]["status"],
+                "push-failed",
+            )
+
     def prepare_approved_commit(self, directory):
         repository = create_git_repository(directory)
         subprocess.run(
@@ -1541,6 +2379,7 @@ class PublicationLifecycleTests(unittest.TestCase):
         committed["workspace"]["head_sha"] = commit_sha
         committed["publication"] = {
             "status": "committed",
+            "cycle_id": 1,
             "commit_sha": commit_sha,
             "pushed_sha": None,
             "packet_identity": committed["approval"]["packet_identity"],
@@ -1549,104 +2388,40 @@ class PublicationLifecycleTests(unittest.TestCase):
             ],
             "checks": ["staged fingerprint equals approved packet"],
             "published_at": None,
+            "finalized_at": None,
+            "remote_name": None,
+            "remote_url": None,
+            "observed_remote_sha": None,
         }
         return committed
 
-    def test_authorized_commit_then_push_preserves_precommit_approval(self):
+    def test_ordinary_update_cannot_self_assert_pushed_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
-            (
-                repository,
-                remote,
-                base_sha,
-                commit_sha,
-                approved,
-            ) = self.prepare_approved_commit(directory)
-            committed = self.committed_state(approved, commit_sha)
-
-            direct_pushed = json.loads(json.dumps(committed))
-            direct_pushed["pull_request"]["head_sha"] = commit_sha
-            direct_pushed["publication"].update(
-                {
-                    "status": "pushed",
-                    "pushed_sha": commit_sha,
-                    "published_at": "2026-07-24T13:00:00Z",
-                }
-            )
-            with self.assertRaises(context_store.StateValidationError):
-                context_store.update_state(
-                    repository,
-                    17,
-                    0,
-                    direct_pushed,
-                )
-
-            result = context_store.update_state(
+            repository, _, _ = self.prepare_approved_index(directory)
+            committed = context_store.commit_approved_state(
                 repository,
                 17,
-                0,
-                committed,
-            )
-            self.assertEqual(result["publication"]["status"], "committed")
-            self.assertEqual(result["pull_request"]["head_sha"], base_sha)
-            self.assertEqual(
-                result["approval"]["packet_identity"]["head_sha"],
-                base_sha,
-            )
-            self.assertEqual(result["workspace"]["head_sha"], commit_sha)
-
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(repository),
-                    "push",
-                    "-q",
-                    "origin",
-                    f"{commit_sha}:refs/heads/feature/parser",
-                ],
-                check=True,
-            )
-            remote_head = subprocess.run(
-                [
-                    "git",
-                    "--git-dir",
-                    str(remote),
-                    "rev-parse",
-                    "refs/heads/feature/parser",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            self.assertEqual(remote_head, commit_sha)
-
+                expected_revision=0,
+            )["state"]
+            commit_sha = committed["publication"]["commit_sha"]
             pushed = json.loads(json.dumps(committed))
             pushed["revision"] = 2
             pushed["pull_request"]["head_sha"] = commit_sha
+            pushed["status"] = "pushed"
             pushed["publication"].update(
                 {
                     "status": "pushed",
                     "pushed_sha": commit_sha,
                     "published_at": "2026-07-24T13:00:00Z",
+                    "finalized_at": "2026-07-24T13:00:00Z",
+                    "remote_name": "origin",
+                    "remote_url": "https://github.com/acme/widgets.git",
+                    "observed_remote_sha": commit_sha,
                 }
             )
-            completed = context_store.update_state(
-                repository,
-                17,
-                1,
-                pushed,
-            )
-            self.assertEqual(completed["publication"]["status"], "pushed")
-            self.assertEqual(completed["publication"]["pushed_sha"], commit_sha)
-            self.assertEqual(completed["pull_request"]["head_sha"], commit_sha)
-            self.assertEqual(
-                completed["approval"]["packet_identity"]["head_sha"],
-                base_sha,
-            )
-            self.assertEqual(
-                context_store.read_state(repository, 17),
-                completed,
-            )
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(repository, 17, 1, pushed)
 
     def test_publication_checkpoint_rejects_incoherent_fields(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1874,6 +2649,60 @@ class RecoveryTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_sanctioned_publication_commands_are_exposed(self):
+        parser = context_store.create_parser()
+        commands = (
+            (
+                [
+                    "commit-approved",
+                    "--repo",
+                    "/tmp/repo",
+                    "--pr",
+                    "17",
+                    "--expected-revision",
+                    "3",
+                ],
+                "commit-approved",
+            ),
+            (
+                [
+                    "push-approved",
+                    "--repo",
+                    "/tmp/repo",
+                    "--pr",
+                    "17",
+                    "--expected-revision",
+                    "4",
+                    "--remote-name",
+                    "origin",
+                    "--remote-url",
+                    "/tmp/remote.git",
+                ],
+                "push-approved",
+            ),
+            (
+                [
+                    "start-cycle",
+                    "--repo",
+                    "/tmp/repo",
+                    "--pr",
+                    "17",
+                    "--expected-revision",
+                    "5",
+                    "--workspace",
+                    "/tmp/workspace",
+                    "--workspace-kind",
+                    "worktree",
+                    "--head-sha",
+                    "a" * 40,
+                ],
+                "start-cycle",
+            ),
+        )
+        for argv, expected in commands:
+            with self.subTest(command=expected):
+                self.assertEqual(parser.parse_args(argv).command, expected)
+
     def test_read_missing_state_prints_null(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = create_git_repository(directory)

@@ -263,6 +263,65 @@ class SkillContractTests(unittest.TestCase):
             normalized,
         )
 
+    def test_runtime_commit_and_push_use_only_sanctioned_commands(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn("context_store.py commit-approved", self.text)
+        self.assertIn("context_store.py push-approved", self.text)
+        self.assertIn(
+            "`commit-approved` is the only sanctioned runtime commit path; "
+            "never run `git commit`.",
+            normalized,
+        )
+        self.assertIn(
+            "`push-approved` is the only sanctioned push and pushed-state "
+            "transition.",
+            normalized,
+        )
+        self.assertIn("git ls-remote", self.text)
+        self.assertIn(
+            "Initialization and ordinary JSON updates cannot create any "
+            "publication checkpoint.",
+            normalized,
+        )
+
+    def test_sanctioned_operations_close_index_and_remote_self_assertion(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn("GIT_INDEX_FILE", self.text)
+        self.assertIn(
+            "Remove ambient Git index and repository overrides for every "
+            "real-index inspection; temporary-index mode sets only its own "
+            "isolated index.",
+            normalized,
+        )
+        self.assertIn(
+            "The command verifies remote H, performs one normal non-force "
+            "push of C to the exact branch, re-reads the remote ref, and "
+            "persists `pushed` only when it equals C.",
+            normalized,
+        )
+
+    def test_failed_publication_and_later_cycles_are_sanctioned(self):
+        normalized = " ".join(self.text.split())
+        for phrase in (
+            "`superseded`",
+            "`push-failed`",
+            "`publication_history`",
+            "`cycle_id`",
+            "context_store.py start-cycle",
+        ):
+            self.assertIn(phrase, self.text)
+        self.assertIn(
+            "A moved remote is recorded without attempting a push, invalidates "
+            "authority, and enters reconciliation with the observed remote SHA.",
+            normalized,
+        )
+        self.assertIn(
+            "`start-cycle` is the only sanctioned reset after a terminal "
+            "publication; it archives the terminal record, increments the "
+            "cycle, and installs only a validated refreshed workspace/head.",
+            normalized,
+        )
+
     def test_recovery_requires_canonical_backup_authorization(self):
         normalized = " ".join(self.text.split())
         self.assertIn("`leave-untouched`", self.text)

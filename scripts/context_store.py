@@ -2,6 +2,7 @@
 """Persist private per-PR handoff context inside a repository's Git data."""
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -16,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STORE_DIRECTORY = "apply-pr-reviews"
 STATE_FILENAME = "state.json"
 RECOVERY_FILENAME = "recovery.json"
@@ -35,6 +36,8 @@ REQUIRED_TOP_LEVEL = {
     "decision_history",
     "approval",
     "publication",
+    "cycle_id",
+    "publication_history",
     "updated_at",
 }
 FORBIDDEN_KEY = re.compile(
@@ -149,16 +152,27 @@ APPROVAL_FIELDS = {
 }
 PUBLICATION_FIELDS = {
     "status",
+    "cycle_id",
     "commit_sha",
     "pushed_sha",
     "packet_identity",
     "approval_decision_history_index",
     "checks",
     "published_at",
+    "finalized_at",
+    "remote_name",
+    "remote_url",
+    "observed_remote_sha",
 }
-PUBLICATION_STATUSES = {"committed", "pushed"}
+PUBLICATION_STATUSES = {
+    "committed",
+    "pushed",
+    "superseded",
+    "push-failed",
+}
+TERMINAL_PUBLICATION_STATUSES = {"pushed", "superseded", "push-failed"}
 RAW_ENV_ASSIGNMENT = re.compile(
-    r"(?m)^\s*[A-Z_][A-Z0-9_]{1,}\s*=\s*(?P<value>.*?)\s*$"
+    r"(?m)^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?P<value>.*?)\s*$"
 )
 SENSITIVE_ASSIGNMENT = re.compile(
     r"(?im)^\s*(?:authorization|api[_ -]?key|client[_ -]?secret|"
@@ -185,6 +199,16 @@ SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"(?im)^\s*[✓*]?\s*logged in to .+ account .+$"),
     re.compile(r"(?im)^\s*[-*]?\s*token scopes?\s*:"),
 )
+GIT_CONTEXT_ENVIRONMENT_KEYS = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_WORK_TREE",
+}
 
 
 class ContextStoreError(RuntimeError):
@@ -207,6 +231,13 @@ class StateLockError(ContextStoreError):
     """Raised when another process owns the PR state lock."""
 
 
+def _sanitized_git_environment():
+    environment = os.environ.copy()
+    for key in GIT_CONTEXT_ENVIRONMENT_KEYS:
+        environment.pop(key, None)
+    return environment
+
+
 def run_command(command, *, cwd=None):
     try:
         completed = subprocess.run(
@@ -215,6 +246,7 @@ def run_command(command, *, cwd=None):
             check=False,
             capture_output=True,
             text=True,
+            env=_sanitized_git_environment(),
         )
     except FileNotFoundError as error:
         raise GitContextError(
@@ -708,6 +740,93 @@ def _validate_approval(state):
         )
 
 
+def _validate_optional_sha(value, path):
+    if value is not None and (
+        not isinstance(value, str) or not SHA_PATTERN.fullmatch(value)
+    ):
+        raise StateValidationError(f"{path} is invalid.")
+
+
+def _validate_publication_shape(publication, path):
+    _require_exact_object(publication, PUBLICATION_FIELDS, path)
+    if publication["status"] not in PUBLICATION_STATUSES:
+        raise StateValidationError(f"{path}.status is invalid.")
+    cycle_id = publication["cycle_id"]
+    if (
+        not isinstance(cycle_id, int)
+        or isinstance(cycle_id, bool)
+        or cycle_id < 1
+    ):
+        raise StateValidationError(f"{path}.cycle_id is invalid.")
+    commit_sha = publication["commit_sha"]
+    if not isinstance(commit_sha, str) or not SHA_PATTERN.fullmatch(commit_sha):
+        raise StateValidationError(f"{path}.commit_sha is invalid.")
+    _validate_optional_sha(publication["pushed_sha"], f"{path}.pushed_sha")
+    _validate_optional_sha(
+        publication["observed_remote_sha"],
+        f"{path}.observed_remote_sha",
+    )
+    for field in ("published_at", "finalized_at", "remote_name", "remote_url"):
+        value = publication[field]
+        if value is not None:
+            _require_nonempty_string(value, f"{path}.{field}")
+    packet = _validate_packet_identity(
+        publication["packet_identity"], f"{path}.packet_identity"
+    )
+    _validate_string_list(
+        publication["checks"],
+        f"{path}.checks",
+        minimum=1,
+    )
+    status = publication["status"]
+    if status == "committed":
+        if any(
+            publication[field] is not None
+            for field in (
+                "pushed_sha",
+                "published_at",
+                "finalized_at",
+                "remote_name",
+                "remote_url",
+                "observed_remote_sha",
+            )
+        ):
+            raise StateValidationError(
+                f"{path} committed fields are incoherent."
+            )
+    elif status == "pushed":
+        if (
+            publication["pushed_sha"] != commit_sha
+            or publication["observed_remote_sha"] != commit_sha
+        ):
+            raise StateValidationError(
+                f"{path} pushed SHA fields must equal commit_sha."
+            )
+        for field in (
+            "published_at",
+            "finalized_at",
+            "remote_name",
+            "remote_url",
+        ):
+            _require_nonempty_string(publication[field], f"{path}.{field}")
+    else:
+        if (
+            publication["pushed_sha"] is not None
+            or publication["published_at"] is not None
+        ):
+            raise StateValidationError(
+                f"{path} failed publication cannot claim a push."
+            )
+        for field in (
+            "finalized_at",
+            "remote_name",
+            "remote_url",
+            "observed_remote_sha",
+        ):
+            _require_nonempty_string(publication[field], f"{path}.{field}")
+    return packet
+
+
 def _validate_publication(state):
     publication = state["publication"]
     if publication is None:
@@ -721,19 +840,15 @@ def _validate_publication(state):
                 "Pre-publication workspace SHAs must equal the PR head."
             )
         return
-    _require_exact_object(publication, PUBLICATION_FIELDS, "publication")
-    if publication["status"] not in PUBLICATION_STATUSES:
-        raise StateValidationError("publication.status is invalid.")
+    packet = _validate_publication_shape(publication, "publication")
     commit_sha = publication["commit_sha"]
-    if not isinstance(commit_sha, str) or not SHA_PATTERN.fullmatch(commit_sha):
-        raise StateValidationError("publication.commit_sha is invalid.")
-    packet = _validate_packet_identity(
-        publication["packet_identity"], "publication.packet_identity"
-    )
+    if publication["cycle_id"] != state["cycle_id"]:
+        raise StateValidationError(
+            "publication.cycle_id must equal the current cycle_id."
+        )
     approval = state["approval"]
     if (
         not isinstance(approval, dict)
-        or approval["valid"] is not True
         or approval["packet_identity"] != packet
         or approval["decision_history_index"]
         != publication["approval_decision_history_index"]
@@ -750,11 +865,6 @@ def _validate_publication(state):
         raise StateValidationError(
             "Publication requires an approved publish outcome."
         )
-    _validate_string_list(
-        publication["checks"],
-        "publication.checks",
-        minimum=1,
-    )
     workspace = state["workspace"]
     pull_head = state["pull_request"]["head_sha"]
     if (
@@ -767,27 +877,52 @@ def _validate_publication(state):
         )
     if publication["status"] == "committed":
         if (
-            publication["pushed_sha"] is not None
-            or publication["published_at"] is not None
+            approval["valid"] is not True
             or pull_head != workspace["base_sha"]
         ):
             raise StateValidationError(
                 "Committed checkpoint has incoherent push or PR-head fields."
             )
-    else:
+    elif publication["status"] == "pushed":
         if (
-            publication["pushed_sha"] != commit_sha
+            approval["valid"] is not True
             or pull_head != commit_sha
         ):
             raise StateValidationError(
                 "Pushed publication must advance the PR head to the commit."
             )
-        _require_nonempty_string(
-            publication["published_at"], "publication.published_at"
-        )
+    else:
+        if (
+            approval["valid"] is not False
+            or pull_head != publication["observed_remote_sha"]
+        ):
+            raise StateValidationError(
+                "Failed publication must invalidate approval and record "
+                "the observed remote head."
+            )
 
 
-def _run_bytes(command, *, env=None):
+def _validate_publication_history(state):
+    history = state["publication_history"]
+    if not isinstance(history, list):
+        raise StateValidationError("publication_history must be a list.")
+    previous_cycle = 0
+    for index, publication in enumerate(history):
+        path = f"publication_history[{index}]"
+        _validate_publication_shape(publication, path)
+        if publication["status"] not in TERMINAL_PUBLICATION_STATUSES:
+            raise StateValidationError(f"{path} must be terminal.")
+        cycle_id = publication["cycle_id"]
+        if cycle_id <= previous_cycle or cycle_id >= state["cycle_id"]:
+            raise StateValidationError(
+                "publication_history cycle IDs must be ordered and archived."
+            )
+        previous_cycle = cycle_id
+
+
+def _run_bytes(command, *, env=None, input_bytes=None):
+    if env is None:
+        env = _sanitized_git_environment()
     try:
         completed = subprocess.run(
             command,
@@ -795,6 +930,7 @@ def _run_bytes(command, *, env=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
+            input=input_bytes,
         )
     except FileNotFoundError as error:
         raise GitContextError(
@@ -868,7 +1004,7 @@ def _tree_file_record(workspace, treeish, included_path):
 
 
 def _index_environment(index_path):
-    environment = os.environ.copy()
+    environment = _sanitized_git_environment()
     environment["GIT_INDEX_FILE"] = str(index_path)
     return environment
 
@@ -1169,6 +1305,13 @@ def validate_state(state, expected_pr=None):
     revision = state["revision"]
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 0:
         raise StateValidationError("revision must be a non-negative integer.")
+    cycle_id = state["cycle_id"]
+    if (
+        not isinstance(cycle_id, int)
+        or isinstance(cycle_id, bool)
+        or cycle_id < 1
+    ):
+        raise StateValidationError("cycle_id must be a positive integer.")
     repository = state["repository"]
     pull_request = state["pull_request"]
     if not isinstance(repository, dict) or set(repository) != {
@@ -1216,6 +1359,7 @@ def validate_state(state, expected_pr=None):
     _validate_decision_history(state)
     _validate_approval(state)
     _validate_publication(state)
+    _validate_publication_history(state)
     _reject_sensitive_content(state)
     return state
 
@@ -1514,6 +1658,14 @@ def initialize_state(repo_path, pr_number, state, *, runner=run_command):
     validate_state(state, pr_number)
     _validate_repository_path(state, repo_path)
     _validate_workspace_runtime(state)
+    if state["publication"] is not None:
+        raise StateValidationError(
+            "Initialization cannot create a publication checkpoint."
+        )
+    if state["cycle_id"] != 1 or state["publication_history"]:
+        raise StateValidationError(
+            "Initialization must begin with cycle 1 and empty publication history."
+        )
     if state["revision"] != 0:
         raise StateValidationError("Initial state revision must be 0.")
     state_dir = state_directory(repo_path, pr_number, runner=runner)
@@ -1653,6 +1805,18 @@ def update_state(
             raise StateValidationError(
                 "decision_history must preserve its existing prefix."
             )
+        if current["publication"] is not None or state["publication"] is not None:
+            raise StateValidationError(
+                "Publication checkpoints require a sanctioned operation."
+            )
+        if (
+            current["cycle_id"] != state["cycle_id"]
+            or current["publication_history"]
+            != state["publication_history"]
+        ):
+            raise StateValidationError(
+                "Publication cycles require the start-cycle operation."
+            )
         _validate_publication_transition(current, state)
         current_approval = current["approval"]
         if (
@@ -1679,6 +1843,528 @@ def update_state(
                 )
         _atomic_write(state_dir / STATE_FILENAME, state)
     return state
+
+
+def commit_approved_state(
+    repo_path,
+    pr_number,
+    expected_revision,
+    *,
+    runner=run_command,
+):
+    state_dir = state_directory(repo_path, pr_number, runner=runner)
+    with pr_lock(state_dir):
+        current = _read_state_document(
+            repo_path,
+            pr_number,
+            runner=runner,
+            validate_runtime=True,
+        )
+        if current is None:
+            raise RevisionConflict(f"State does not exist for PR {pr_number}.")
+        if current["revision"] != expected_revision:
+            raise RevisionConflict(
+                f"Expected revision {expected_revision}, "
+                f"found {current['revision']}."
+            )
+        approval = current["approval"]
+        if (
+            current["publication"] is not None
+            or not isinstance(approval, dict)
+            or approval["valid"] is not True
+            or approval["outcome"] != "approved"
+        ):
+            raise StateValidationError(
+                "commit-approved requires current approved pre-commit state."
+            )
+
+        workspace = Path(current["workspace"]["path"])
+        branch = current["pull_request"]["head_branch"]
+        branch_ref = f"refs/heads/{branch}"
+        _run_bytes(["git", "check-ref-format", branch_ref])
+        actual_ref = _run_bytes(
+            ["git", "-C", str(workspace), "symbolic-ref", "-q", "HEAD"]
+        ).decode("utf-8").strip()
+        if actual_ref != branch_ref:
+            raise StateValidationError(
+                "commit-approved requires the exact attached head branch."
+            )
+        base_sha = current["workspace"]["base_sha"]
+        local_head = _run_bytes(
+            ["git", "-C", str(workspace), "rev-parse", branch_ref]
+        ).decode("ascii").strip()
+        if local_head != base_sha:
+            raise StateValidationError(
+                "Approved branch ref moved before commit-approved."
+            )
+
+        staged = compute_packet_identity(
+            workspace_path=workspace,
+            workspace_kind=current["workspace"]["kind"],
+            base_sha=base_sha,
+            head_repository=current["pull_request"]["head_repository"],
+            head_branch=branch,
+            head_sha=base_sha,
+            commit_message=current["changes"]["commit_message"],
+            included_files=current["changes"]["files"],
+            source="index",
+        )
+        if staged["packet_identity"] != approval["packet_identity"]:
+            raise StateValidationError(
+                "Staged packet does not equal the approved packet."
+            )
+
+        commit_message = approval["packet_identity"]["commit_message"]
+        commit_sha = _run_bytes(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "commit-tree",
+                staged["snapshot_tree"],
+                "-p",
+                base_sha,
+                "-F",
+                "-",
+            ],
+            input_bytes=commit_message.encode("utf-8"),
+        ).decode("ascii").strip()
+
+        committed = copy.deepcopy(current)
+        committed["revision"] = expected_revision + 1
+        committed["phase"] = "publish"
+        committed["status"] = "committed"
+        committed["workspace"]["head_sha"] = commit_sha
+        committed["publication"] = {
+            "status": "committed",
+            "cycle_id": current["cycle_id"],
+            "commit_sha": commit_sha,
+            "pushed_sha": None,
+            "packet_identity": copy.deepcopy(approval["packet_identity"]),
+            "approval_decision_history_index": approval[
+                "decision_history_index"
+            ],
+            "checks": ["approved real-index tree committed by commit-approved"],
+            "published_at": None,
+            "finalized_at": None,
+            "remote_name": None,
+            "remote_url": None,
+            "observed_remote_sha": None,
+        }
+        committed["updated_at"] = _utc_now()
+
+        ref_advanced = False
+        try:
+            _run_bytes(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "update-ref",
+                    branch_ref,
+                    commit_sha,
+                    base_sha,
+                ]
+            )
+            ref_advanced = True
+            validate_state(committed, pr_number)
+            _validate_repository_path(committed, repo_path)
+            _validate_workspace_runtime(committed)
+            _atomic_write(state_dir / STATE_FILENAME, committed)
+        except BaseException:
+            if ref_advanced:
+                try:
+                    _run_bytes(
+                        [
+                            "git",
+                            "-C",
+                            str(workspace),
+                            "update-ref",
+                            branch_ref,
+                            base_sha,
+                            commit_sha,
+                        ]
+                    )
+                except ContextStoreError:
+                    pass
+            raise
+
+    return {
+        "operation": "commit-approved",
+        "commit_sha": commit_sha,
+        "snapshot_tree": staged["snapshot_tree"],
+        "state": committed,
+    }
+
+
+def _remote_branch_head(workspace, remote_url, branch_ref):
+    output = _run_bytes(
+        ["git", "-C", str(workspace), "ls-remote", "--heads", remote_url, branch_ref]
+    ).decode("utf-8")
+    records = [line.split("\t", 1) for line in output.splitlines() if line]
+    if len(records) != 1 or records[0][1] != branch_ref:
+        raise StateValidationError(
+            "Remote branch must resolve to exactly one head."
+        )
+    sha = records[0][0]
+    if not SHA_PATTERN.fullmatch(sha):
+        raise StateValidationError("Remote branch head is invalid.")
+    return sha
+
+
+def push_approved_state(
+    repo_path,
+    pr_number,
+    expected_revision,
+    *,
+    remote_name,
+    remote_url,
+    runner=run_command,
+):
+    _require_nonempty_string(remote_name, "remote_name")
+    _require_nonempty_string(remote_url, "remote_url")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", remote_name):
+        raise StateValidationError("remote_name is invalid.")
+    state_dir = state_directory(repo_path, pr_number, runner=runner)
+    with pr_lock(state_dir):
+        current = _read_state_document(
+            repo_path,
+            pr_number,
+            runner=runner,
+            validate_runtime=True,
+        )
+        if current is None:
+            raise RevisionConflict(f"State does not exist for PR {pr_number}.")
+        if current["revision"] != expected_revision:
+            raise RevisionConflict(
+                f"Expected revision {expected_revision}, "
+                f"found {current['revision']}."
+            )
+        publication = current["publication"]
+        approval = current["approval"]
+        if (
+            not isinstance(publication, dict)
+            or publication["status"] != "committed"
+            or not isinstance(approval, dict)
+            or approval["valid"] is not True
+            or approval["packet_identity"] != publication["packet_identity"]
+        ):
+            raise StateValidationError(
+                "push-approved requires the sanctioned committed checkpoint."
+            )
+
+        workspace = Path(current["workspace"]["path"])
+        configured_url = _run_bytes(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "remote",
+                "get-url",
+                remote_name,
+            ]
+        ).decode("utf-8").strip()
+        if configured_url != remote_url:
+            raise StateValidationError(
+                "Configured remote URL does not match push-approved input."
+            )
+        branch_ref = f"refs/heads/{current['pull_request']['head_branch']}"
+        _run_bytes(["git", "check-ref-format", branch_ref])
+        approved_head = publication["packet_identity"]["head_sha"]
+        observed_before = _remote_branch_head(
+            workspace, remote_url, branch_ref
+        )
+        if observed_before != approved_head:
+            finalized_at = _utc_now()
+            superseded = copy.deepcopy(current)
+            superseded["revision"] = expected_revision + 1
+            superseded["phase"] = "reconcile"
+            superseded["status"] = "superseded"
+            superseded["pull_request"]["head_sha"] = observed_before
+            superseded["approval"]["valid"] = False
+            superseded["publication"]["status"] = "superseded"
+            superseded["publication"]["checks"].append(
+                "push-approved observed remote head different from approved H"
+            )
+            superseded["publication"]["finalized_at"] = finalized_at
+            superseded["publication"]["remote_name"] = remote_name
+            superseded["publication"]["remote_url"] = remote_url
+            superseded["publication"][
+                "observed_remote_sha"
+            ] = observed_before
+            superseded["decision_history"].append(
+                {
+                    "revision": expected_revision + 1,
+                    "timestamp": finalized_at,
+                    "decision_type": "approval-invalidated",
+                    "evidence": [
+                        f"push-approved observed remote head {observed_before}"
+                    ],
+                    "options": [],
+                    "recommendation": (
+                        "Refresh feedback and reconcile from the observed "
+                        "remote head."
+                    ),
+                    "answer": "Publication superseded before push.",
+                    "scope": DECISION_SCOPE,
+                    "transition": "committed -> superseded",
+                    "packet_identity": copy.deepcopy(
+                        approval["packet_identity"]
+                    ),
+                    "question": "",
+                    "outcome": None,
+                    "recovery": None,
+                }
+            )
+            superseded["updated_at"] = finalized_at
+            validate_state(superseded, pr_number)
+            _validate_repository_path(superseded, repo_path)
+            _validate_workspace_runtime(superseded)
+            _atomic_write(state_dir / STATE_FILENAME, superseded)
+            return {
+                "operation": "push-approved",
+                "outcome": "superseded",
+                "remote_name": remote_name,
+                "remote_url": remote_url,
+                "branch": current["pull_request"]["head_branch"],
+                "observed_before": observed_before,
+                "observed_after": observed_before,
+                "commit_sha": publication["commit_sha"],
+                "state": superseded,
+            }
+
+        commit_sha = publication["commit_sha"]
+        try:
+            _run_bytes(
+                [
+                    "git",
+                    "-C",
+                    str(workspace),
+                    "push",
+                    "--porcelain",
+                    remote_name,
+                    f"{commit_sha}:{branch_ref}",
+                ]
+            )
+        except ContextStoreError:
+            observed_after = _remote_branch_head(
+                workspace, remote_url, branch_ref
+            )
+            finalized_at = _utc_now()
+            failed = copy.deepcopy(current)
+            failed["revision"] = expected_revision + 1
+            failed["phase"] = "reconcile"
+            failed["status"] = "push-failed"
+            failed["pull_request"]["head_sha"] = observed_after
+            failed["approval"]["valid"] = False
+            failed["publication"]["status"] = "push-failed"
+            failed["publication"]["checks"].append(
+                "push-approved failed and re-read the remote head"
+            )
+            failed["publication"]["finalized_at"] = finalized_at
+            failed["publication"]["remote_name"] = remote_name
+            failed["publication"]["remote_url"] = remote_url
+            failed["publication"][
+                "observed_remote_sha"
+            ] = observed_after
+            failed["decision_history"].append(
+                {
+                    "revision": expected_revision + 1,
+                    "timestamp": finalized_at,
+                    "decision_type": "approval-invalidated",
+                    "evidence": [
+                        f"push-approved failed with remote head {observed_after}"
+                    ],
+                    "options": [],
+                    "recommendation": (
+                        "Inspect the push failure and begin a refreshed cycle."
+                    ),
+                    "answer": "Publication push failed.",
+                    "scope": DECISION_SCOPE,
+                    "transition": "committed -> push-failed",
+                    "packet_identity": copy.deepcopy(
+                        approval["packet_identity"]
+                    ),
+                    "question": "",
+                    "outcome": None,
+                    "recovery": None,
+                }
+            )
+            failed["updated_at"] = finalized_at
+            validate_state(failed, pr_number)
+            _validate_repository_path(failed, repo_path)
+            _validate_workspace_runtime(failed)
+            _atomic_write(state_dir / STATE_FILENAME, failed)
+            return {
+                "operation": "push-approved",
+                "outcome": "push-failed",
+                "remote_name": remote_name,
+                "remote_url": remote_url,
+                "branch": current["pull_request"]["head_branch"],
+                "observed_before": observed_before,
+                "observed_after": observed_after,
+                "commit_sha": commit_sha,
+                "state": failed,
+            }
+        observed_after = _remote_branch_head(
+            workspace, remote_url, branch_ref
+        )
+        if observed_after != commit_sha:
+            raise StateValidationError(
+                "Remote branch does not equal the sanctioned commit after push."
+            )
+
+        pushed = copy.deepcopy(current)
+        pushed["revision"] = expected_revision + 1
+        pushed["pull_request"]["head_sha"] = commit_sha
+        pushed["status"] = "pushed"
+        pushed["publication"]["status"] = "pushed"
+        pushed["publication"]["pushed_sha"] = commit_sha
+        pushed["publication"]["checks"].append(
+            "push-approved verified remote H then remote C"
+        )
+        pushed["publication"]["published_at"] = _utc_now()
+        pushed["publication"]["finalized_at"] = pushed["publication"][
+            "published_at"
+        ]
+        pushed["publication"]["remote_name"] = remote_name
+        pushed["publication"]["remote_url"] = remote_url
+        pushed["publication"]["observed_remote_sha"] = observed_after
+        pushed["updated_at"] = pushed["publication"]["published_at"]
+        validate_state(pushed, pr_number)
+        _validate_repository_path(pushed, repo_path)
+        _validate_workspace_runtime(pushed)
+        _atomic_write(state_dir / STATE_FILENAME, pushed)
+
+    return {
+        "operation": "push-approved",
+        "outcome": "pushed",
+        "remote_name": remote_name,
+        "remote_url": remote_url,
+        "branch": current["pull_request"]["head_branch"],
+        "observed_before": observed_before,
+        "observed_after": observed_after,
+        "commit_sha": commit_sha,
+        "state": pushed,
+    }
+
+
+def start_cycle(
+    repo_path,
+    pr_number,
+    expected_revision,
+    *,
+    workspace_path,
+    workspace_kind,
+    head_sha,
+    runner=run_command,
+):
+    if workspace_kind not in WORKSPACE_KINDS:
+        raise StateValidationError("workspace_kind is invalid.")
+    if not isinstance(head_sha, str) or not SHA_PATTERN.fullmatch(head_sha):
+        raise StateValidationError("head_sha is invalid.")
+    workspace = Path(workspace_path).expanduser().resolve()
+    actual_head = _workspace_head(workspace)
+    if actual_head != head_sha:
+        raise StateValidationError(
+            "Refreshed workspace HEAD does not equal supplied head_sha."
+        )
+
+    state_dir = state_directory(repo_path, pr_number, runner=runner)
+    with pr_lock(state_dir):
+        current = _read_state_document(
+            repo_path,
+            pr_number,
+            runner=runner,
+            validate_runtime=True,
+        )
+        if current is None:
+            raise RevisionConflict(f"State does not exist for PR {pr_number}.")
+        if current["revision"] != expected_revision:
+            raise RevisionConflict(
+                f"Expected revision {expected_revision}, "
+                f"found {current['revision']}."
+            )
+        publication = current["publication"]
+        if (
+            not isinstance(publication, dict)
+            or publication["status"] not in TERMINAL_PUBLICATION_STATUSES
+        ):
+            raise StateValidationError(
+                "start-cycle requires a terminal publication checkpoint."
+            )
+        expected_head = (
+            publication["commit_sha"]
+            if publication["status"] == "pushed"
+            else publication["observed_remote_sha"]
+        )
+        if head_sha != expected_head:
+            raise StateValidationError(
+                "Refreshed cycle head does not match the terminal remote head."
+            )
+
+        started_at = _utc_now()
+        next_state = copy.deepcopy(current)
+        next_state["revision"] = expected_revision + 1
+        next_state["cycle_id"] = current["cycle_id"] + 1
+        next_state["publication_history"].append(
+            copy.deepcopy(publication)
+        )
+        next_state["publication"] = None
+        next_state["approval"] = None
+        next_state["pending_decisions"] = []
+        next_state["changes"] = {
+            "files": [],
+            "summary": "",
+            "diff_sha256": hashlib.sha256(b"").hexdigest(),
+            "commit_message": "",
+        }
+        next_state["verification"] = {"baseline": [], "final": []}
+        next_state["pull_request"]["head_sha"] = head_sha
+        next_state["workspace"] = {
+            "kind": workspace_kind,
+            "path": str(workspace),
+            "base_sha": head_sha,
+            "head_sha": head_sha,
+        }
+        next_state["phase"] = "evaluate"
+        next_state["status"] = "active"
+        next_state["decision_history"].append(
+            {
+                "revision": expected_revision + 1,
+                "timestamp": started_at,
+                "decision_type": "cycle-start",
+                "evidence": [
+                    f"archived terminal publication cycle {current['cycle_id']}",
+                    f"refreshed workspace head {head_sha}",
+                ],
+                "options": [],
+                "recommendation": "Evaluate the refreshed PR cycle.",
+                "answer": "Started the next review cycle.",
+                "scope": DECISION_SCOPE,
+                "transition": (
+                    f"{publication['status']} -> evaluate"
+                ),
+                "packet_identity": None,
+                "question": "",
+                "outcome": None,
+                "recovery": None,
+            }
+        )
+        next_state["updated_at"] = started_at
+        validate_state(next_state, pr_number)
+        _validate_repository_path(next_state, repo_path)
+        _validate_workspace_runtime(next_state)
+        _atomic_write(state_dir / STATE_FILENAME, next_state)
+
+    return {
+        "operation": "start-cycle",
+        "archived_cycle_id": current["cycle_id"],
+        "cycle_id": next_state["cycle_id"],
+        "head_sha": head_sha,
+        "workspace": copy.deepcopy(next_state["workspace"]),
+        "state": next_state,
+    }
 
 
 def _read_input():
@@ -1708,6 +2394,35 @@ def create_parser():
             command.add_argument("--recovery-question", required=True)
             command.add_argument("--human-answer", required=True)
             command.add_argument("--outcome", required=True)
+    commit_approved = subparsers.add_parser("commit-approved")
+    commit_approved.add_argument("--repo", required=True, type=Path)
+    commit_approved.add_argument("--pr", required=True, type=int)
+    commit_approved.add_argument(
+        "--expected-revision", required=True, type=int
+    )
+    push_approved = subparsers.add_parser("push-approved")
+    push_approved.add_argument("--repo", required=True, type=Path)
+    push_approved.add_argument("--pr", required=True, type=int)
+    push_approved.add_argument(
+        "--expected-revision", required=True, type=int
+    )
+    push_approved.add_argument("--remote-name", required=True)
+    push_approved.add_argument("--remote-url", required=True)
+    start_cycle_command = subparsers.add_parser("start-cycle")
+    start_cycle_command.add_argument("--repo", required=True, type=Path)
+    start_cycle_command.add_argument("--pr", required=True, type=int)
+    start_cycle_command.add_argument(
+        "--expected-revision", required=True, type=int
+    )
+    start_cycle_command.add_argument(
+        "--workspace", required=True, type=Path
+    )
+    start_cycle_command.add_argument(
+        "--workspace-kind",
+        required=True,
+        choices=sorted(WORKSPACE_KINDS),
+    )
+    start_cycle_command.add_argument("--head-sha", required=True)
     fingerprint = subparsers.add_parser("fingerprint")
     fingerprint.add_argument("--workspace", required=True, type=Path)
     fingerprint.add_argument(
@@ -1756,6 +2471,29 @@ def main(argv=None):
                 recovery_question=args.recovery_question,
                 human_answer=args.human_answer,
                 outcome=args.outcome,
+            )
+        elif args.command == "commit-approved":
+            result = commit_approved_state(
+                args.repo,
+                args.pr,
+                args.expected_revision,
+            )
+        elif args.command == "push-approved":
+            result = push_approved_state(
+                args.repo,
+                args.pr,
+                args.expected_revision,
+                remote_name=args.remote_name,
+                remote_url=args.remote_url,
+            )
+        elif args.command == "start-cycle":
+            result = start_cycle(
+                args.repo,
+                args.pr,
+                args.expected_revision,
+                workspace_path=args.workspace,
+                workspace_kind=args.workspace_kind,
+                head_sha=args.head_sha,
             )
         else:
             result = compute_packet_identity(
