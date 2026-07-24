@@ -135,8 +135,9 @@ class SkillContractTests(unittest.TestCase):
             "Do not show the gate unless the stored `pending_decisions` entry "
             "itself contains all five fields: `question`, `options`, "
             "`recommendation`, `scope`, and `packet_identity`. When stating exact "
-            "actions, name all five stored fields; saying only that the decision "
-            "was persisted or listing only packet identity is insufficient.",
+            "actions, explicitly name the `pending_decisions` container and all "
+            "five stored fields; saying only that a pending decision or record "
+            "was persisted, or listing only packet identity, is insufficient.",
             normalized,
         )
 
