@@ -74,8 +74,11 @@ Use this Iron Law:
 NO COMMIT OR PUSH WITHOUT AN APPROVED, CURRENT PACKET
 ```
 
-Clarify that an approval is current only while its PR head SHA, diff, included
-files, commit message, and push target remain unchanged.
+Define `packet_identity` as exactly `head_repository`, `head_branch`,
+`head_sha`, `diff_sha256`, `included_files`, and `commit_message`.
+`diff_sha256` is a lowercase deterministic SHA-256 of canonical patch bytes,
+including untracked-file patches. Approval is current only while every field
+matches the current PR target and changes.
 
 ## Process
 
@@ -144,11 +147,20 @@ push.
 Persist the decision request before showing it so a later agent can resume from
 the same evidence and paused scope.
 
+A valid approval is not a free-standing boolean. It has exactly `valid`,
+`packet_identity`, `decision_history_index`, and `human_answer`; it must link to
+an append-only `publish-approval` history entry containing the same complete
+packet and non-empty exact human answer. Initialization and takeover reject
+approval that lacks any part of that evidence.
+
 ### Phase 6: Commit and Push
 
-After approval, fetch and compare the remote head with the approved SHA. If it
-moved, invalidate approval, refresh the ledger, reconcile changes, rerun
-verification, and present a new packet.
+After approval, fetch and compare the remote target and all change-identity
+fields. A changed head repository, head branch, head SHA, diff SHA-256,
+included-file list, or commit message requires a current-revision
+`approval-invalidated` event for the old packet. Preserve invalid approval
+history for audit, but never use it as publication authority. Reconcile,
+reverify, and obtain a newly linked human decision for the new packet.
 
 If it is unchanged, stage only displayed files, create the displayed commit,
 and push normally to the displayed branch. Never force-push.
@@ -220,13 +232,27 @@ Use `state.json` as the single authoritative handoff document. Include:
 - base branch, head repository, head branch, and recorded head SHA;
 - current phase and status;
 - review-ledger dispositions with evidence;
-- changed files and diff summary;
+- changed files, deterministic diff SHA-256, diff summary, and commit message;
 - baseline and verification commands with results;
 - pending human decisions and paused scope;
 - append-only decision history within the document;
 - approved packet identity and its validity state;
 - commit and push results when completed;
 - update timestamp.
+
+Use exact nested shapes. Review entries contain `url`, `author`,
+`requested_behavior`, `evidence`, and a fixed disposition. `changes` contains
+`files`, `summary`, `diff_sha256`, and `commit_message`. Pending decisions
+contain all five fields `question`, `options`, `recommendation`, `scope`, and
+`packet_identity`; only non-publish decisions may use a null packet. Decision
+history adds `packet_identity` to the existing decision evidence. Publication
+contains `commit_sha`, `pushed_sha`, `packet_identity`,
+`approval_decision_history_index`, `checks`, and `published_at`, and must link
+to retained approval and its exact publish decision.
+
+The machine disposition values are `current-and-actionable`, `resolved`,
+`outdated`, `duplicate`, `already-addressed`, `superseded`,
+`conflicting-or-ambiguous`, and `incorrect-harmful-or-out-of-scope`.
 
 For every decision-history entry, record:
 
@@ -250,7 +276,10 @@ tool rather than editing ledger files directly. The tool must:
 - print the current snapshot for agent takeover;
 - accept state-update payloads only through standard input;
 - never store or modify context outside the resolved Git common directory;
-- never store credentials, environment variables, or authentication output.
+- never store secret-shaped keys or sensitive values, including raw
+  environment/authentication output, authorization headers, cookies,
+  credential assignments, private keys, or common credential formats;
+- allow safe summaries such as authentication success and check results.
 
 Always release the lock in a `finally` path. Never break an existing or stale
 lock automatically; report it as a scoped blocker with lock metadata so the
@@ -318,8 +347,14 @@ the identity of the work.
 - Treat a context revision conflict as concurrent work: reload and reconcile
   instead of overwriting another agent's decisions.
 - Treat corrupt or mismatched local context as a scoped blocker. Preserve the
-  unreadable file, report it, and require an explicit human decision before
-  replacing decision history.
+  unreadable file and history exactly, report it with the complete
+  `HUMAN DECISION REQUIRED` shape, and require explicit authorization before
+  moving it to a named private backup and initializing fresh state. Never
+  overwrite, delete, repair, rename, or replace it automatically.
+- Because invalid state cannot safely persist its own pending record, treat
+  this as the sole persistence-order exception: show the recovery gate first,
+  then, only after authorization and backup, record the exact question and
+  answer as the first decision in fresh state.
 
 ## Rationalization Defense
 

@@ -25,8 +25,11 @@ human decisions explicit. Publish only the exact approved work.**
 NO COMMIT OR PUSH WITHOUT AN APPROVED, CURRENT PACKET
 ```
 
-A packet is current only while its PR head SHA, diff, files, commit message,
-and push target remain unchanged.
+A `packet_identity` has exactly `head_repository`, `head_branch`, `head_sha`,
+`diff_sha256`, `included_files`, and `commit_message`. `diff_sha256` is the
+lowercase SHA-256 of deterministic canonical patch bytes for the sorted
+included files, including untracked-file patches, not a prose diff summary.
+A packet is current only while every field remains unchanged.
 
 Current approval is required before `git add`, `git commit`, or `git push`.
 
@@ -91,6 +94,10 @@ Run focused checks after each batch and the complete required verification.
 Exclude unsafe changes and changes that introduce failures. Persist every
 verified batch.
 
+Persist only summarized command results and evidence. Never store raw
+environment output, raw authentication output, authorization headers, cookies,
+credentials, or credential material in any key or value.
+
 ### Phase 5: Request Approval
 
 Always persist the pending approval decision first and render the complete gate;
@@ -115,6 +122,13 @@ show the gate. First refresh feedback, reconcile edits, and rerun verification;
 only then build and persist a new current packet and pending decision before
 displaying the gate.
 
+A valid approval must match the current `pull_request` target and the current
+`changes` exactly, and must link to an append-only `publish-approval`
+decision-history entry with the same complete `packet_identity` and the
+non-empty exact `human_answer`. Store that linkage as
+`decision_history_index`. Approval objects have exactly `valid`,
+`packet_identity`, `decision_history_index`, and `human_answer`.
+
 ```text
 HUMAN DECISION REQUIRED
 
@@ -137,10 +151,15 @@ the **exact push target:** repository and branch.
 
 ### Phase 6: Commit and Push
 
-Record the human answer before resuming. Fetch the remote head again.
+Record the exact human answer and complete packet in a `publish-approval`
+decision-history entry before resuming. Fetch the remote head again.
 
-If the SHA changed, invalidate approval, refresh feedback, reconcile edits,
-rerun verification, persist the invalidation, and request new approval.
+A change to the head repository, head branch, head SHA, `diff_sha256`,
+`included_files`, or `commit_message` invalidates approval. Persist an
+`approval-invalidated` history entry for the old packet, refresh feedback when
+the head changed, reconcile edits, rerun verification, and request new
+approval. Retain invalid approval history for audit, but never treat it as
+publication authority.
 
 If unchanged, stage only displayed files, create the displayed commit, and push
 normally to the displayed branch. Never force-push. Persist commit SHA, pushed
@@ -198,6 +217,33 @@ At takeover:
 4. Revalidate stale evidence and mark superseded conclusions.
 5. Preserve human decisions only while their assumptions hold.
 
+If local state or decision history is unreadable, corrupt, or
+identity-mismatched, stop that PR and show the exact scoped
+`HUMAN DECISION REQUIRED` gate before replacing or removing anything. Never
+overwrite, delete, repair, rename, or replace unreadable or mismatched state or
+history automatically.
+
+This recovery gate is the only pending-decision persistence exception: do not
+mutate an invalid ledger to record the question. Show the gate first; after
+explicit backup authorization, preserve the original in the named private
+backup and make the exact recovery question and human answer the first
+decision-history entry in fresh state.
+
+```text
+HUMAN DECISION REQUIRED
+
+PR: <PR URL>
+Decision: How should the preserved invalid local state be handled?
+Why this cannot be decided safely: Replacing it could destroy handoff history.
+Recommendation: Leave it untouched until its provenance is understood.
+
+Options:
+1. Leave the preserved state untouched and stop this PR.
+2. Authorize moving the invalid state to a named private backup, then initialize fresh state.
+
+Paused scope: This PR only.
+```
+
 Use `scripts/context_store.py`; never edit `state.json` directly. Every update
 must supply the expected revision. On a revision conflict or lock, stop the
 affected PR, reload, reconcile, and retry. Never break a lock automatically.
@@ -209,9 +255,20 @@ Every complete state document has these top-level fields:
 
 `repository` contains `name_with_owner` and the configured `local_path`.
 `pull_request` contains `number`, `url`, `base_branch`, `head_repository`,
-`head_branch`, and `head_sha`. Each decision-history entry contains `revision`,
-`timestamp`, `decision_type`, `evidence`, `options`, `recommendation`, `answer`,
-`scope`, and `transition`. Keep decision history append-only.
+`head_branch`, and `head_sha`. Each review-ledger entry has exactly `url`,
+`author`, `requested_behavior`, `evidence`, and `disposition`. `changes` has
+exactly `files`, `summary`, `diff_sha256`, and `commit_message`. `disposition`
+is exactly one of `current-and-actionable`, `resolved`, `outdated`, `duplicate`,
+`already-addressed`, `superseded`, `conflicting-or-ambiguous`, or
+`incorrect-harmful-or-out-of-scope`. Every pending
+decision has exactly `question`, `options`, `recommendation`, `scope`, and
+`packet_identity`; use `null` packet identity only for non-publish decisions.
+Each decision-history entry contains `revision`, `timestamp`, `decision_type`,
+`evidence`, `options`, `recommendation`, `answer`, `scope`, `transition`, and
+`packet_identity`. A publish decision requires the exact packet and answer.
+Publication has exactly `commit_sha`, `pushed_sha`, `packet_identity`,
+`approval_decision_history_index`, `checks`, and `published_at`, and links to
+the same publish decision. Keep decision history append-only.
 
 Persist after classification, baseline, each verified batch, before and after a
 human decision, before approval, after head invalidation, and after commit,
@@ -268,6 +325,7 @@ The ledger is handoff evidence, not authority to bypass verification.
 - Breaking a context lock automatically
 - Proceeding while correctness evidence is missing
 - Treating old human decisions as valid after their assumptions changed
+- Replacing corrupt or mismatched state without the scoped human decision
 - Force-pushing
 - Mutating review threads or PR state without a separate request
 

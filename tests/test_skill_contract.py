@@ -82,6 +82,16 @@ class SkillContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, self.text.lower())
 
+    def test_documents_exact_review_disposition_values(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "`disposition` is exactly one of `current-and-actionable`, "
+            "`resolved`, `outdated`, `duplicate`, `already-addressed`, "
+            "`superseded`, `conflicting-or-ambiguous`, or "
+            "`incorrect-harmful-or-out-of-scope`.",
+            normalized,
+        )
+
     def test_forbids_unrequested_github_mutations(self):
         for phrase in (
             "reply to review threads",
@@ -153,6 +163,86 @@ class SkillContractTests(unittest.TestCase):
             "before displaying the gate.",
             normalized,
         )
+
+    def test_packet_identity_and_human_linkage_are_exact(self):
+        normalized = " ".join(self.text.split())
+        for phrase in (
+            "head_repository",
+            "head_branch",
+            "head_sha",
+            "diff_sha256",
+            "included_files",
+            "commit_message",
+            "SHA-256",
+            "decision_history_index",
+            "publish-approval",
+            "human_answer",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.text)
+        self.assertIn(
+            "A valid approval must match the current `pull_request` target and "
+            "the current `changes` exactly, and must link to an append-only "
+            "`publish-approval` decision-history entry with the same complete "
+            "`packet_identity` and the non-empty exact `human_answer`.",
+            normalized,
+        )
+
+    def test_all_packet_changes_invalidate_approval(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "A change to the head repository, head branch, head SHA, "
+            "`diff_sha256`, `included_files`, or `commit_message` invalidates "
+            "approval.",
+            normalized,
+        )
+        self.assertIn(
+            "Retain invalid approval history for audit, but never treat it as "
+            "publication authority.",
+            normalized,
+        )
+
+    def test_requires_summaries_and_prohibits_sensitive_raw_values(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Persist only summarized command results and evidence. Never store "
+            "raw environment output, raw authentication output, authorization "
+            "headers, cookies, credentials, or credential material in any key "
+            "or value.",
+            normalized,
+        )
+
+    def test_corrupt_or_mismatched_state_uses_scoped_human_gate(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "If local state or decision history is unreadable, corrupt, or "
+            "identity-mismatched, stop that PR and show the exact scoped "
+            "`HUMAN DECISION REQUIRED` gate before replacing or removing "
+            "anything.",
+            normalized,
+        )
+        self.assertIn(
+            "Never overwrite, delete, repair, rename, or replace unreadable or "
+            "mismatched state or history automatically.",
+            normalized,
+        )
+        self.assertIn(
+            "This recovery gate is the only pending-decision persistence "
+            "exception: do not mutate an invalid ledger to record the question. "
+            "Show the gate first; after explicit backup authorization, preserve "
+            "the original in the named private backup and make the exact "
+            "recovery question and human answer the first decision-history "
+            "entry in fresh state.",
+            normalized,
+        )
+        for phrase in (
+            "Decision: How should the preserved invalid local state be handled?",
+            "Paused scope: This PR only.",
+            "Leave the preserved state untouched and stop this PR.",
+            "Authorize moving the invalid state to a named private backup",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.text)
 
     def test_is_concise_and_has_no_template_placeholders(self):
         self.assertLess(len(self.lines), 500)

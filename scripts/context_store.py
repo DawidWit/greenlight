@@ -50,6 +50,45 @@ FORBIDDEN_NORMALIZED_PATTERN = re.compile(
     r"|(?:auth|authentication)outputs?"
 )
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+CHANGES_FIELDS = {
+    "files",
+    "summary",
+    "diff_sha256",
+    "commit_message",
+}
+REVIEW_FIELDS = {
+    "url",
+    "author",
+    "requested_behavior",
+    "evidence",
+    "disposition",
+}
+REVIEW_DISPOSITIONS = {
+    "current-and-actionable",
+    "resolved",
+    "outdated",
+    "duplicate",
+    "already-addressed",
+    "superseded",
+    "conflicting-or-ambiguous",
+    "incorrect-harmful-or-out-of-scope",
+}
+PACKET_FIELDS = {
+    "head_repository",
+    "head_branch",
+    "head_sha",
+    "diff_sha256",
+    "included_files",
+    "commit_message",
+}
+PENDING_DECISION_FIELDS = {
+    "question",
+    "options",
+    "recommendation",
+    "scope",
+    "packet_identity",
+}
 DECISION_FIELDS = {
     "revision",
     "timestamp",
@@ -60,7 +99,50 @@ DECISION_FIELDS = {
     "answer",
     "scope",
     "transition",
+    "packet_identity",
 }
+APPROVAL_FIELDS = {
+    "valid",
+    "packet_identity",
+    "decision_history_index",
+    "human_answer",
+}
+PUBLICATION_FIELDS = {
+    "commit_sha",
+    "pushed_sha",
+    "packet_identity",
+    "approval_decision_history_index",
+    "checks",
+    "published_at",
+}
+PUBLISH_APPROVAL_QUESTION = "Approve this exact commit and push for this PR?"
+RAW_ENV_ASSIGNMENT = re.compile(
+    r"(?m)^[A-Z_][A-Z0-9_]{1,}\s*=\s*\S.*$"
+)
+SENSITIVE_VALUE_PATTERNS = (
+    re.compile(
+        r"(?i)\b(?:authorization|api[_ -]?key|client[_ -]?secret|"
+        r"password|secret|token|cookie)\b\s*[:=]\s*\S+"
+    ),
+    re.compile(r"(?i)\bauthorization\s*:\s*(?:bearer|basic)\s+\S+"),
+    re.compile(r"\b(?:github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9]{10,})\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(
+        r"\b(?:sk-|sk_live_|sk_test_|sk-proj-)[A-Za-z0-9_-]{10,}\b"
+    ),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}\b"),
+    re.compile(
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\."
+        r"[A-Za-z0-9_-]{5,}\b"
+    ),
+    re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----"),
+    re.compile(r"(?i)https?://[^/\s:@]+:[^/\s@]+@"),
+    re.compile(r"(?im)^\s*[✓*]?\s*logged in to .+ account .+$"),
+    re.compile(r"(?im)^\s*[-*]?\s*token scopes?\s*:"),
+)
 
 
 class ContextStoreError(RuntimeError):
@@ -140,7 +222,7 @@ def state_directory(repo_path, pr_number, *, runner=run_command):
     return target
 
 
-def _reject_forbidden_keys(value, path="state"):
+def _reject_sensitive_content(value, path="state"):
     if isinstance(value, dict):
         for key, nested in value.items():
             if not isinstance(key, str):
@@ -152,10 +234,289 @@ def _reject_forbidden_keys(value, path="state"):
                 or FORBIDDEN_NORMALIZED_PATTERN.fullmatch(normalized_key)
             ):
                 raise StateValidationError(f"Forbidden key at {path}.{key}.")
-            _reject_forbidden_keys(nested, f"{path}.{key}")
+            _reject_sensitive_content(nested, f"{path}.{key}")
     elif isinstance(value, list):
         for index, nested in enumerate(value):
-            _reject_forbidden_keys(nested, f"{path}[{index}]")
+            _reject_sensitive_content(nested, f"{path}[{index}]")
+    elif isinstance(value, str):
+        if RAW_ENV_ASSIGNMENT.search(value) or any(
+            pattern.search(value) for pattern in SENSITIVE_VALUE_PATTERNS
+        ):
+            raise StateValidationError(f"Sensitive value at {path}.")
+
+
+def _require_exact_object(value, fields, path):
+    if not isinstance(value, dict) or set(value) != fields:
+        raise StateValidationError(f"{path} has invalid fields.")
+    return value
+
+
+def _require_nonempty_string(value, path):
+    if not isinstance(value, str) or not value.strip():
+        raise StateValidationError(f"{path} must be a non-empty string.")
+    return value
+
+
+def _validate_string_list(
+    value,
+    path,
+    *,
+    minimum=0,
+    maximum=None,
+    unique=False,
+    sorted_values=False,
+):
+    if not isinstance(value, list):
+        raise StateValidationError(f"{path} must be a list.")
+    if len(value) < minimum or (
+        maximum is not None and len(value) > maximum
+    ):
+        raise StateValidationError(f"{path} has an invalid item count.")
+    for index, item in enumerate(value):
+        _require_nonempty_string(item, f"{path}[{index}]")
+    if unique and len(value) != len(set(value)):
+        raise StateValidationError(f"{path} must not contain duplicates.")
+    if sorted_values and value != sorted(value):
+        raise StateValidationError(f"{path} must be sorted.")
+    return value
+
+
+def _validate_packet_identity(packet, path):
+    _require_exact_object(packet, PACKET_FIELDS, path)
+    for field in ("head_repository", "head_branch", "commit_message"):
+        _require_nonempty_string(packet[field], f"{path}.{field}")
+    if (
+        not isinstance(packet["head_sha"], str)
+        or not SHA_PATTERN.fullmatch(packet["head_sha"])
+    ):
+        raise StateValidationError(f"{path}.head_sha is invalid.")
+    if (
+        not isinstance(packet["diff_sha256"], str)
+        or not SHA256_PATTERN.fullmatch(packet["diff_sha256"])
+    ):
+        raise StateValidationError(f"{path}.diff_sha256 is invalid.")
+    _validate_string_list(
+        packet["included_files"],
+        f"{path}.included_files",
+        minimum=1,
+        unique=True,
+        sorted_values=True,
+    )
+    return packet
+
+
+def _current_packet_identity(state):
+    return {
+        "head_repository": state["pull_request"]["head_repository"],
+        "head_branch": state["pull_request"]["head_branch"],
+        "head_sha": state["pull_request"]["head_sha"],
+        "diff_sha256": state["changes"]["diff_sha256"],
+        "included_files": state["changes"]["files"],
+        "commit_message": state["changes"]["commit_message"],
+    }
+
+
+def _validate_review_ledger(review_ledger):
+    if not isinstance(review_ledger, list):
+        raise StateValidationError("review_ledger must be a list.")
+    for index, entry in enumerate(review_ledger):
+        path = f"review_ledger[{index}]"
+        _require_exact_object(entry, REVIEW_FIELDS, path)
+        for field in ("url", "author", "requested_behavior"):
+            _require_nonempty_string(entry[field], f"{path}.{field}")
+        _validate_string_list(entry["evidence"], f"{path}.evidence")
+        if entry["disposition"] not in REVIEW_DISPOSITIONS:
+            raise StateValidationError(f"{path}.disposition is invalid.")
+
+
+def _validate_changes(changes):
+    _require_exact_object(changes, CHANGES_FIELDS, "changes")
+    _validate_string_list(
+        changes["files"],
+        "changes.files",
+        unique=True,
+        sorted_values=True,
+    )
+    if not isinstance(changes["summary"], str):
+        raise StateValidationError("changes.summary must be a string.")
+    if (
+        not isinstance(changes["diff_sha256"], str)
+        or not SHA256_PATTERN.fullmatch(changes["diff_sha256"])
+    ):
+        raise StateValidationError("changes.diff_sha256 is invalid.")
+    if not isinstance(changes["commit_message"], str):
+        raise StateValidationError("changes.commit_message must be a string.")
+
+
+def _validate_pending_decisions(state):
+    pending_decisions = state["pending_decisions"]
+    if not isinstance(pending_decisions, list):
+        raise StateValidationError("pending_decisions must be a list.")
+    current_packet = _current_packet_identity(state)
+    for index, decision in enumerate(pending_decisions):
+        path = f"pending_decisions[{index}]"
+        _require_exact_object(decision, PENDING_DECISION_FIELDS, path)
+        for field in ("question", "recommendation", "scope"):
+            _require_nonempty_string(decision[field], f"{path}.{field}")
+        _validate_string_list(
+            decision["options"],
+            f"{path}.options",
+            minimum=2,
+            maximum=3,
+            unique=True,
+        )
+        packet = decision["packet_identity"]
+        if packet is not None:
+            _validate_packet_identity(packet, f"{path}.packet_identity")
+            if packet != current_packet:
+                raise StateValidationError(
+                    f"{path}.packet_identity is not current."
+                )
+        if decision["question"] == PUBLISH_APPROVAL_QUESTION and packet is None:
+            raise StateValidationError(
+                f"{path}.packet_identity is required for publish approval."
+            )
+
+
+def _validate_decision_history(state):
+    revision = state["revision"]
+    previous_revision = -1
+    for index, decision in enumerate(state["decision_history"]):
+        path = f"decision_history[{index}]"
+        _require_exact_object(decision, DECISION_FIELDS, path)
+        decision_revision = decision["revision"]
+        if (
+            not isinstance(decision_revision, int)
+            or isinstance(decision_revision, bool)
+            or decision_revision < previous_revision
+            or decision_revision > revision
+        ):
+            raise StateValidationError(f"{path}.revision is invalid.")
+        previous_revision = decision_revision
+        for field in (
+            "timestamp",
+            "decision_type",
+            "recommendation",
+            "answer",
+            "scope",
+            "transition",
+        ):
+            _require_nonempty_string(decision[field], f"{path}.{field}")
+        for field in ("evidence", "options"):
+            _validate_string_list(decision[field], f"{path}.{field}")
+        packet = decision["packet_identity"]
+        if packet is not None:
+            _validate_packet_identity(packet, f"{path}.packet_identity")
+        if decision["decision_type"] == "publish-approval" and packet is None:
+            raise StateValidationError(
+                f"{path}.packet_identity is required for publish approval."
+            )
+
+
+def _linked_publish_decision(state, index, packet, human_answer=None):
+    if (
+        not isinstance(index, int)
+        or isinstance(index, bool)
+        or index < 0
+        or index >= len(state["decision_history"])
+    ):
+        raise StateValidationError(
+            "Approval decision-history linkage is invalid."
+        )
+    decision = state["decision_history"][index]
+    if (
+        decision["decision_type"] != "publish-approval"
+        or decision["packet_identity"] != packet
+        or (
+            human_answer is not None
+            and decision["answer"] != human_answer
+        )
+    ):
+        raise StateValidationError(
+            "Approval does not match its publish-approval decision."
+        )
+    return decision
+
+
+def _validate_approval(state):
+    approval = state["approval"]
+    if approval is None:
+        return
+    _require_exact_object(approval, APPROVAL_FIELDS, "approval")
+    if not isinstance(approval["valid"], bool):
+        raise StateValidationError("approval.valid must be a boolean.")
+    packet = _validate_packet_identity(
+        approval["packet_identity"], "approval.packet_identity"
+    )
+    human_answer = _require_nonempty_string(
+        approval["human_answer"], "approval.human_answer"
+    )
+    decision_index = approval["decision_history_index"]
+    _linked_publish_decision(
+        state,
+        decision_index,
+        packet,
+        human_answer,
+    )
+    later_history = state["decision_history"][decision_index + 1 :]
+    was_invalidated = any(
+        decision["decision_type"] == "approval-invalidated"
+        and decision["packet_identity"] == packet
+        for decision in later_history
+    )
+    if approval["valid"] and was_invalidated:
+        raise StateValidationError(
+            "approval.valid cannot override later invalidation history."
+        )
+    if approval["valid"] and packet != _current_packet_identity(state):
+        raise StateValidationError(
+            "Valid approval packet does not match current PR changes."
+        )
+    if approval["valid"] and any(
+        pending["question"] == PUBLISH_APPROVAL_QUESTION
+        and pending["packet_identity"] == packet
+        for pending in state["pending_decisions"]
+    ):
+        raise StateValidationError(
+            "A valid approval cannot remain pending for the same packet."
+        )
+
+
+def _validate_publication(state):
+    publication = state["publication"]
+    if publication is None:
+        return
+    _require_exact_object(publication, PUBLICATION_FIELDS, "publication")
+    for field in ("commit_sha", "pushed_sha"):
+        value = publication[field]
+        if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
+            raise StateValidationError(f"publication.{field} is invalid.")
+    packet = _validate_packet_identity(
+        publication["packet_identity"], "publication.packet_identity"
+    )
+    approval = state["approval"]
+    if (
+        not isinstance(approval, dict)
+        or approval["packet_identity"] != packet
+        or approval["decision_history_index"]
+        != publication["approval_decision_history_index"]
+    ):
+        raise StateValidationError(
+            "Publication does not match the retained approval evidence."
+        )
+    _linked_publish_decision(
+        state,
+        publication["approval_decision_history_index"],
+        packet,
+    )
+    _validate_string_list(
+        publication["checks"],
+        "publication.checks",
+        minimum=1,
+    )
+    _require_nonempty_string(
+        publication["published_at"], "publication.published_at"
+    )
 
 
 def validate_state(state, expected_pr=None):
@@ -205,50 +566,20 @@ def validate_state(state, expected_pr=None):
     for key in ("url", "base_branch", "head_repository", "head_branch"):
         if not isinstance(pull_request[key], str) or not pull_request[key]:
             raise StateValidationError(f"pull_request.{key} is invalid.")
-    for key in ("review_ledger", "pending_decisions", "decision_history"):
-        if not isinstance(state[key], list):
-            raise StateValidationError(f"{key} must be a list.")
-    for key in ("changes", "verification"):
-        if not isinstance(state[key], dict):
-            raise StateValidationError(f"{key} must be an object.")
-    for key in ("approval", "publication"):
-        if state[key] is not None and not isinstance(state[key], dict):
-            raise StateValidationError(f"{key} must be null or an object.")
+    if not isinstance(state["decision_history"], list):
+        raise StateValidationError("decision_history must be a list.")
+    if not isinstance(state["verification"], dict):
+        raise StateValidationError("verification must be an object.")
     for key in ("phase", "status", "updated_at"):
         if not isinstance(state[key], str) or not state[key]:
             raise StateValidationError(f"{key} must be a non-empty string.")
-    for index, decision in enumerate(state["decision_history"]):
-        if not isinstance(decision, dict) or set(decision) != DECISION_FIELDS:
-            raise StateValidationError(
-                f"decision_history[{index}] has invalid fields."
-            )
-        if (
-            not isinstance(decision["revision"], int)
-            or isinstance(decision["revision"], bool)
-            or decision["revision"] < 0
-            or decision["revision"] > revision
-        ):
-            raise StateValidationError(
-                f"decision_history[{index}].revision is invalid."
-            )
-        for key in (
-            "timestamp",
-            "decision_type",
-            "recommendation",
-            "answer",
-            "scope",
-            "transition",
-        ):
-            if not isinstance(decision[key], str):
-                raise StateValidationError(
-                    f"decision_history[{index}].{key} must be a string."
-                )
-        for key in ("evidence", "options"):
-            if not isinstance(decision[key], list):
-                raise StateValidationError(
-                    f"decision_history[{index}].{key} must be a list."
-                )
-    _reject_forbidden_keys(state)
+    _validate_review_ledger(state["review_ledger"])
+    _validate_changes(state["changes"])
+    _validate_pending_decisions(state)
+    _validate_decision_history(state)
+    _validate_approval(state)
+    _validate_publication(state)
+    _reject_sensitive_content(state)
     return state
 
 
@@ -298,19 +629,16 @@ def _set_private_mode(path, mode):
     os.chmod(path, mode)
 
 
-def _push_target(state):
-    pull_request = state["pull_request"]
-    return (
-        pull_request["head_repository"],
-        pull_request["head_branch"],
-        pull_request["head_sha"],
-    )
-
-
-def _has_current_invalidation_event(old_history, new_history, revision):
+def _has_current_invalidation_event(
+    old_history,
+    new_history,
+    revision,
+    packet_identity,
+):
     return any(
-        decision["decision_type"] == "head-sha-invalidated"
+        decision["decision_type"] == "approval-invalidated"
         and decision["revision"] == revision
+        and decision["packet_identity"] == packet_identity
         for decision in new_history[len(old_history) :]
     )
 
@@ -429,21 +757,26 @@ def update_state(
             )
         current_approval = current["approval"]
         if (
-            _push_target(current) != _push_target(state)
+            _current_packet_identity(current) != _current_packet_identity(state)
             and isinstance(current_approval, dict)
             and current_approval.get("valid") is True
         ):
             approval = state["approval"]
+            invalidated_approval = dict(current_approval)
+            invalidated_approval["valid"] = False
             if (
-                not isinstance(approval, dict)
-                or approval.get("valid") is not False
+                approval != invalidated_approval
                 or not _has_current_invalidation_event(
-                    old_history, new_history, state["revision"]
+                    old_history,
+                    new_history,
+                    state["revision"],
+                    current_approval["packet_identity"],
                 )
             ):
                 raise StateValidationError(
-                    "A push target change must invalidate approval and append "
-                    "a current-revision head-sha-invalidated decision."
+                    "An approved packet change must invalidate approval and "
+                    "append a matching current-revision approval-invalidated "
+                    "decision."
                 )
         _atomic_write(state_dir / STATE_FILENAME, state)
     return state

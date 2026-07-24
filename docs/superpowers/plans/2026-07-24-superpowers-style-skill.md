@@ -14,7 +14,9 @@
 - Store context only under `<git-common-dir>/apply-pr-reviews/pr-<number>/state.json`.
 - Use directory mode `0700` and file mode `0600` where the platform supports POSIX permissions.
 - Never commit, push, or synchronize local decision state.
-- Never store credentials, environment variables, authentication output, or secret-shaped fields.
+- Never store secret-shaped fields or sensitive values such as raw environment
+  output, raw authentication output, authorization headers, cookies, private
+  keys, or common credential material. Store safe summaries only.
 - Require a current exact approval packet before `git add`, `git commit`, or `git push`.
 - The target skill's Iron Law governs runtime use of the completed
   `apply-pr-reviews` skill on pull requests. It does not prohibit local
@@ -1970,3 +1972,104 @@ git commit -m "test: harden PR review decision handoff"
 ```
 
 If Step 3 changed no files, do not create an empty commit.
+
+---
+
+## Task 6: Final-Review Approval and Takeover Hardening
+
+This task supersedes the nested-state and approval snippets in Tasks 1-5.
+Top-level schema version remains `1`; existing version-1 documents that lack
+the strict nested fields fail closed and require the corrupt/mismatched-state
+human recovery path rather than automatic migration.
+
+**Canonical nested contract:**
+
+```text
+review_ledger[] =
+  {url, author, requested_behavior, evidence[], disposition}
+
+changes =
+  {files[], summary, diff_sha256, commit_message}
+
+packet_identity =
+  {head_repository, head_branch, head_sha, diff_sha256,
+   included_files[], commit_message}
+
+pending_decisions[] =
+  {question, options[], recommendation, scope, packet_identity|null}
+
+decision_history[] =
+  {revision, timestamp, decision_type, evidence[], options[],
+   recommendation, answer, scope, transition, packet_identity|null}
+
+approval =
+  null |
+  {valid, packet_identity, decision_history_index, human_answer}
+
+publication =
+  null |
+  {commit_sha, pushed_sha, packet_identity,
+   approval_decision_history_index, checks[], published_at}
+```
+
+`disposition` uses exactly `current-and-actionable`, `resolved`, `outdated`,
+`duplicate`, `already-addressed`, `superseded`,
+`conflicting-or-ambiguous`, or `incorrect-harmful-or-out-of-scope`.
+
+`head_sha`, commit SHA, and pushed SHA are lowercase 40-hex values.
+`diff_sha256` is lowercase 64-hex SHA-256 of deterministic canonical patch
+bytes. File lists are sorted, unique, and exact. A valid approval packet must
+equal the current head repository, head branch, head SHA, change diff hash,
+files, and commit message. Its index must resolve to an append-only
+`publish-approval` decision containing the same packet and its `human_answer`
+must equal that entry's non-empty exact answer. A publication must link to the
+same retained approval and decision.
+
+Changing any packet field while an approval is valid requires preserving the
+approval with `valid: false` and appending an `approval-invalidated` entry at
+the new revision for the old packet. An earlier invalidation cannot be reused.
+A replacement valid packet requires a new linked publish decision. Invalid
+history remains audit evidence only.
+
+Confidentiality validation recursively inspects keys and string values. It
+rejects raw environment assignments, raw authentication status, authorization
+and cookie material, private keys, embedded URL credentials, JWTs, and common
+GitHub, AWS, Slack, Stripe/OpenAI, Google, and npm credential formats. Safe
+summaries and evidence remain allowed.
+
+Unreadable, corrupt, or repository/PR-mismatched state is never overwritten,
+deleted, repaired, renamed, or replaced automatically. Stop only that PR and
+show the full `HUMAN DECISION REQUIRED` gate. The safe option leaves it
+untouched; the recovery option requires explicit authorization to move it to a
+named private backup before initializing new state. This is the sole
+pending-decision persistence exception: never mutate invalid state to record
+the question; after authorized backup, make the exact recovery question and
+human answer the first history entry in fresh state.
+
+### RED
+
+Add focused tests for:
+
+- forged valid approval at initialization, with and without incomplete human
+  evidence;
+- all six packet-identity changes;
+- exact review, changes, pending-decision, decision-history, approval, and
+  publication shapes and links;
+- recursive sensitive values plus allowed summaries;
+- the exact corrupt/mismatched-state skill gate.
+
+Run the focused tests and confirm failures arise from the missing validation
+and skill rules.
+
+### GREEN
+
+Implement the canonical validators and exact linkage rules in
+`scripts/context_store.py`; update `SKILL.md` and the design contract. Preserve
+the existing atomic write, PR lock, expected-revision CAS, and append-only
+history behavior.
+
+### Verification
+
+Run the full suite, Python compilation, both CLI help commands, the skill
+validator, `git diff --check`, and a clean-status inspection. Self-review the
+complete branch interaction before the final commit.

@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import os
 import subprocess
@@ -18,6 +19,8 @@ SPEC = importlib.util.spec_from_file_location("context_store", SCRIPT_PATH)
 context_store = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(context_store)
+
+EMPTY_DIFF_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class RecordingRunner:
@@ -54,7 +57,12 @@ def valid_state(
         "phase": "evaluate",
         "status": "active",
         "review_ledger": [],
-        "changes": {"files": [], "summary": ""},
+        "changes": {
+            "files": [],
+            "summary": "",
+            "diff_sha256": EMPTY_DIFF_SHA256,
+            "commit_message": "",
+        },
         "verification": {"baseline": [], "final": []},
         "pending_decisions": [],
         "decision_history": [],
@@ -69,6 +77,7 @@ def decision_event(
     decision_type="agent-disposition",
     answer="Apply",
     transition="evaluate -> baseline",
+    packet_identity=None,
 ):
     return {
         "revision": revision,
@@ -80,7 +89,72 @@ def decision_event(
         "answer": answer,
         "scope": "PR #17",
         "transition": transition,
+        "packet_identity": packet_identity,
     }
+
+
+def approval_packet(
+    head_repository="acme/widgets",
+    head_branch="feature/parser",
+    head_sha="a" * 40,
+    diff_sha256="b" * 64,
+    included_files=None,
+    commit_message="Apply parser review fixes",
+):
+    if included_files is None:
+        included_files = ["src/parser.py", "tests/test_parser.py"]
+    return {
+        "head_repository": head_repository,
+        "head_branch": head_branch,
+        "head_sha": head_sha,
+        "diff_sha256": diff_sha256,
+        "included_files": included_files,
+        "commit_message": commit_message,
+    }
+
+
+def state_with_current_changes(**kwargs):
+    state = valid_state(**kwargs)
+    packet = approval_packet(
+        head_repository=state["pull_request"]["head_repository"],
+        head_branch=state["pull_request"]["head_branch"],
+        head_sha=state["pull_request"]["head_sha"],
+    )
+    state["changes"].update(
+        {
+            "files": packet["included_files"],
+            "diff_sha256": packet["diff_sha256"],
+            "commit_message": packet["commit_message"],
+        }
+    )
+    return state
+
+
+def approve_state(state, revision=0, answer="Yes, publish this exact packet."):
+    packet = approval_packet(
+        head_repository=state["pull_request"]["head_repository"],
+        head_branch=state["pull_request"]["head_branch"],
+        head_sha=state["pull_request"]["head_sha"],
+        diff_sha256=state["changes"]["diff_sha256"],
+        included_files=state["changes"]["files"],
+        commit_message=state["changes"]["commit_message"],
+    )
+    state["decision_history"].append(
+        decision_event(
+            revision=revision,
+            decision_type="publish-approval",
+            answer=answer,
+            transition="approval -> publish",
+            packet_identity=packet,
+        )
+    )
+    state["approval"] = {
+        "valid": True,
+        "packet_identity": packet,
+        "decision_history_index": len(state["decision_history"]) - 1,
+        "human_answer": answer,
+    }
+    return state
 
 
 def create_git_repository(directory):
@@ -255,6 +329,212 @@ class SchemaTests(unittest.TestCase):
                 with self.assertRaises(context_store.StateValidationError):
                     context_store.validate_state(state, 17)
 
+    def test_rejects_sensitive_string_values_but_allows_safe_summaries(self):
+        sensitive_values = (
+            "PATH=/usr/local/bin\nHOME=/Users/example\nSHELL=/bin/zsh",
+            "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
+            "github_pat_11AA0_examplecredentialmaterial",
+            "AKIAIOSFODNN7EXAMPLE",
+            "sk-abcdefghijklmnopqrstuvwxyz123456",
+            "AIzaSyExampleCredentialMaterial123456",
+            "npm_exampleCredentialMaterial1234567890",
+            "Bearer abcdefghijklmnopqrstuvwxyz123456",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            "-----BEGIN PRIVATE KEY-----\nnot-safe\n-----END PRIVATE KEY-----",
+            "https://build-user:super-secret@example.com/artifact",
+            "✓ Logged in to github.com account octocat\n- Token scopes: 'repo'",
+        )
+        for value in sensitive_values:
+            with self.subTest(value=value[:30]):
+                state = valid_state()
+                state["verification"]["final"] = [{"summary": value}]
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(state, 17)
+
+        safe = valid_state()
+        safe["verification"]["final"] = [
+            {
+                "summary": (
+                    "Authentication check passed. Environment-dependent tests "
+                    "passed. Credential scan reported no findings."
+                )
+            }
+        ]
+        self.assertIs(context_store.validate_state(safe, 17), safe)
+
+    def test_review_ledger_entries_have_an_exact_safe_shape(self):
+        state = valid_state()
+        state["review_ledger"] = [
+            {
+                "url": "https://github.com/acme/widgets/pull/17#discussion_r1",
+                "author": "reviewer",
+                "requested_behavior": "Reject empty parser input.",
+                "evidence": ["src/parser.py:42 currently accepts it."],
+                "disposition": "current-and-actionable",
+            }
+        ]
+        self.assertIs(context_store.validate_state(state, 17), state)
+
+        malformed_entries = (
+            {"url": "https://example.test/review"},
+            {
+                **state["review_ledger"][0],
+                "unexpected": "unsafe takeover ambiguity",
+            },
+            {**state["review_ledger"][0], "evidence": "not a list"},
+            {**state["review_ledger"][0], "disposition": "invented"},
+        )
+        for entry in malformed_entries:
+            with self.subTest(entry=entry):
+                malformed = valid_state()
+                malformed["review_ledger"] = [entry]
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(malformed, 17)
+
+    def test_changes_and_pending_decisions_have_exact_shapes(self):
+        state = state_with_current_changes()
+        packet = approval_packet()
+        pending = {
+            "question": "Approve this exact commit and push for this PR?",
+            "options": [
+                "Approve the exact displayed commit and push.",
+                "Reject it and keep the verified diff local.",
+                "Request changes to the proposed work.",
+            ],
+            "recommendation": "Approve only if the packet is correct.",
+            "scope": "This PR only.",
+            "packet_identity": packet,
+        }
+        state["pending_decisions"] = [pending]
+        self.assertIs(context_store.validate_state(state, 17), state)
+
+        for field in pending:
+            with self.subTest(missing=field):
+                malformed = state_with_current_changes()
+                malformed["pending_decisions"] = [
+                    {key: value for key, value in pending.items() if key != field}
+                ]
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(malformed, 17)
+
+        malformed = state_with_current_changes()
+        malformed["changes"]["extra"] = "ambiguous"
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(malformed, 17)
+
+        stale = state_with_current_changes()
+        stale_pending = json.loads(json.dumps(pending))
+        stale_pending["packet_identity"]["diff_sha256"] = "c" * 64
+        stale["pending_decisions"] = [stale_pending]
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(stale, 17)
+
+    def test_valid_approval_requires_exact_packet_and_human_decision_linkage(self):
+        state = approve_state(state_with_current_changes())
+        self.assertIs(context_store.validate_state(state, 17), state)
+
+        malformed_approvals = []
+        missing_field = json.loads(json.dumps(state))
+        del missing_field["approval"]["human_answer"]
+        malformed_approvals.append(missing_field)
+
+        wrong_kind = json.loads(json.dumps(state))
+        wrong_kind["decision_history"][0]["decision_type"] = "agent-disposition"
+        malformed_approvals.append(wrong_kind)
+
+        wrong_index = json.loads(json.dumps(state))
+        wrong_index["approval"]["decision_history_index"] = 42
+        malformed_approvals.append(wrong_index)
+
+        wrong_answer = json.loads(json.dumps(state))
+        wrong_answer["approval"]["human_answer"] = "fabricated answer"
+        malformed_approvals.append(wrong_answer)
+
+        wrong_packet = json.loads(json.dumps(state))
+        wrong_packet["approval"]["packet_identity"]["diff_sha256"] = "c" * 64
+        malformed_approvals.append(wrong_packet)
+
+        for malformed in malformed_approvals:
+            with self.subTest(approval=malformed["approval"]):
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(malformed, 17)
+
+    def test_valid_approval_cannot_leave_its_publish_decision_pending(self):
+        state = approve_state(state_with_current_changes())
+        state["pending_decisions"] = [
+            {
+                "question": "Approve this exact commit and push for this PR?",
+                "options": [
+                    "Approve the exact displayed commit and push.",
+                    "Reject it and keep the verified diff local.",
+                ],
+                "recommendation": "Approve only if the packet is correct.",
+                "scope": "This PR only.",
+                "packet_identity": state["approval"]["packet_identity"],
+            }
+        ]
+
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(state, 17)
+
+    def test_valid_approval_must_match_every_current_packet_field(self):
+        for field, replacement in (
+            ("head_repository", "fork/widgets"),
+            ("head_branch", "feature/rebased"),
+            ("head_sha", "c" * 40),
+            ("diff_sha256", "c" * 64),
+            ("included_files", ["src/other.py"]),
+            ("commit_message", "Different exact message"),
+        ):
+            with self.subTest(field=field):
+                state = approve_state(state_with_current_changes())
+                if field in state["pull_request"]:
+                    state["pull_request"][field] = replacement
+                elif field == "included_files":
+                    state["changes"]["files"] = replacement
+                else:
+                    state["changes"][field] = replacement
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(state, 17)
+
+    def test_publication_has_exact_shape_and_approval_linkage(self):
+        state = approve_state(state_with_current_changes())
+        packet = state["approval"]["packet_identity"]
+        state["publication"] = {
+            "commit_sha": "c" * 40,
+            "pushed_sha": "c" * 40,
+            "packet_identity": packet,
+            "approval_decision_history_index": 0,
+            "checks": ["python3 -m unittest: 52 tests passed"],
+            "published_at": "2026-07-24T12:10:00Z",
+        }
+        self.assertIs(context_store.validate_state(state, 17), state)
+
+        malformed_publications = []
+        missing = json.loads(json.dumps(state))
+        del missing["publication"]["published_at"]
+        malformed_publications.append(missing)
+        wrong_link = json.loads(json.dumps(state))
+        wrong_link["publication"]["approval_decision_history_index"] = 7
+        malformed_publications.append(wrong_link)
+        wrong_packet = json.loads(json.dumps(state))
+        wrong_packet["publication"]["packet_identity"]["commit_message"] = "Other"
+        malformed_publications.append(wrong_packet)
+        wrong_checks = json.loads(json.dumps(state))
+        wrong_checks["publication"]["checks"] = "passed"
+        malformed_publications.append(wrong_checks)
+
+        for malformed in malformed_publications:
+            with self.subTest(publication=malformed["publication"]):
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(malformed, 17)
+
+        missing_approval = json.loads(json.dumps(state))
+        missing_approval["approval"] = None
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(missing_approval, 17)
+
     def test_missing_state_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory, "repo")
@@ -389,120 +669,82 @@ class MutationTests(unittest.TestCase):
                     repository, 17, 0, updated
                 )
 
-    def test_head_change_invalidates_existing_approval(self):
+    def test_initialize_rejects_forged_valid_approval_without_human_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = create_git_repository(directory)
-            initial = valid_state(local_path=str(repository.resolve()))
-            initial["approval"] = {
+            forged = state_with_current_changes(
+                local_path=str(repository.resolve())
+            )
+            forged["approval"] = {
                 "valid": True,
-                "head_sha": "a" * 40,
+                "packet_identity": approval_packet(),
+                "decision_history_index": 0,
+                "human_answer": "Approve it.",
             }
-            context_store.initialize_state(repository, 17, initial)
 
-            unsafe = valid_state(
-                revision=1,
-                head_sha="b" * 40,
-                local_path=str(repository.resolve()),
-            )
-            unsafe["approval"] = initial["approval"]
             with self.assertRaises(context_store.StateValidationError):
-                context_store.update_state(repository, 17, 0, unsafe)
+                context_store.initialize_state(repository, 17, forged)
 
-            safe = valid_state(
-                revision=1,
-                head_sha="b" * 40,
-                local_path=str(repository.resolve()),
+            state_path = (
+                context_store.state_directory(repository, 17) / "state.json"
             )
-            safe["approval"] = {
-                "valid": False,
-                "head_sha": "a" * 40,
-            }
-            safe["decision_history"].append(
-                decision_event(
-                    decision_type="head-sha-invalidated",
-                    answer="Approval invalidated",
-                    transition="approval -> evaluate",
-                )
-            )
-            result = context_store.update_state(
-                repository, 17, 0, safe
-            )
+            self.assertFalse(state_path.exists())
 
-            self.assertFalse(result["approval"]["valid"])
-
-    def test_head_change_requires_a_new_current_revision_invalidation(self):
+    def test_initialize_accepts_valid_approval_with_exact_human_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = create_git_repository(directory)
-            initial = valid_state(local_path=str(repository.resolve()))
-            initial["approval"] = {
-                "valid": True,
-                "head_sha": "a" * 40,
-            }
-            initial["decision_history"].append(
-                decision_event(
-                    revision=0,
-                    decision_type="head-sha-invalidated",
-                    answer="Previous approval invalidated",
-                    transition="approval -> evaluate",
+            state = approve_state(
+                state_with_current_changes(
+                    local_path=str(repository.resolve())
                 )
             )
-            context_store.initialize_state(repository, 17, initial)
 
-            reused_event = valid_state(
-                revision=1,
-                head_sha="b" * 40,
-                local_path=str(repository.resolve()),
-            )
-            reused_event["approval"] = {
-                "valid": False,
-                "head_sha": "a" * 40,
-            }
-            reused_event["decision_history"] = initial["decision_history"]
+            result = context_store.initialize_state(repository, 17, state)
 
-            with self.assertRaises(context_store.StateValidationError):
-                context_store.update_state(repository, 17, 0, reused_event)
+            self.assertTrue(result["approval"]["valid"])
 
-    def test_push_target_change_invalidates_existing_approval(self):
-        for field, value in (
+    def test_every_approved_packet_change_requires_explicit_invalidation(self):
+        mutations = (
             ("head_repository", "fork/widgets"),
-            ("head_branch", "feature/other-parser"),
-        ):
+            ("head_branch", "feature/rebased"),
+            ("head_sha", "c" * 40),
+            ("diff_sha256", "c" * 64),
+            ("files", ["src/other.py"]),
+            ("commit_message", "Different exact message"),
+        )
+        for field, replacement in mutations:
             with self.subTest(field=field):
                 with tempfile.TemporaryDirectory() as directory:
                     repository = create_git_repository(directory)
-                    initial = valid_state(
-                        local_path=str(repository.resolve())
+                    initial = approve_state(
+                        state_with_current_changes(
+                            local_path=str(repository.resolve())
+                        )
                     )
-                    initial["approval"] = {
-                        "valid": True,
-                        "head_sha": "a" * 40,
-                    }
                     context_store.initialize_state(repository, 17, initial)
 
-                    unsafe = valid_state(
-                        revision=1,
-                        local_path=str(repository.resolve()),
-                    )
-                    unsafe["pull_request"][field] = value
-                    unsafe["approval"] = initial["approval"]
+                    unsafe = json.loads(json.dumps(initial))
+                    unsafe["revision"] = 1
+                    if field in unsafe["pull_request"]:
+                        unsafe["pull_request"][field] = replacement
+                    else:
+                        unsafe["changes"][field] = replacement
                     with self.assertRaises(context_store.StateValidationError):
                         context_store.update_state(repository, 17, 0, unsafe)
 
-                    safe = valid_state(
-                        revision=1,
-                        local_path=str(repository.resolve()),
-                    )
-                    safe["pull_request"][field] = value
-                    safe["approval"] = {
-                        "valid": False,
-                        "head_sha": "a" * 40,
-                    }
+                    safe = json.loads(json.dumps(unsafe))
+                    safe["approval"]["valid"] = False
                     safe["decision_history"].append(
                         decision_event(
                             revision=1,
-                            decision_type="head-sha-invalidated",
-                            answer="Approval invalidated",
+                            decision_type="approval-invalidated",
+                            answer=(
+                                f"Approval invalidated because {field} changed."
+                            ),
                             transition="approval -> evaluate",
+                            packet_identity=initial["approval"][
+                                "packet_identity"
+                            ],
                         )
                     )
 
@@ -511,6 +753,32 @@ class MutationTests(unittest.TestCase):
                     )
 
                     self.assertFalse(result["approval"]["valid"])
+
+    def test_approved_packet_change_cannot_reuse_old_invalidation_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = state_with_current_changes(
+                local_path=str(repository.resolve())
+            )
+            initial["decision_history"].append(
+                decision_event(
+                    revision=0,
+                    decision_type="approval-invalidated",
+                    answer="Old event.",
+                    transition="approval -> evaluate",
+                    packet_identity=approval_packet(),
+                )
+            )
+            initial = approve_state(initial)
+            context_store.initialize_state(repository, 17, initial)
+
+            changed = json.loads(json.dumps(initial))
+            changed["revision"] = 1
+            changed["changes"]["diff_sha256"] = "c" * 64
+            changed["approval"]["valid"] = False
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(repository, 17, 0, changed)
 
     @unittest.skipIf(os.name == "nt", "Windows does not use POSIX modes")
     def test_initialize_fails_closed_when_private_mode_cannot_be_set(self):
