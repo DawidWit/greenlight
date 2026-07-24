@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Persist private per-PR handoff context inside a repository's Git data."""
 
+import argparse
 import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -427,3 +429,58 @@ def update_state(
                 )
         _atomic_write(state_dir / STATE_FILENAME, state)
     return state
+
+
+def _read_input():
+    try:
+        return json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        raise StateValidationError("Cannot read JSON state from stdin.") from error
+
+
+def create_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Persist private per-PR handoff context inside Git metadata."
+        )
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    for name in ("read", "init", "update"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--repo", required=True, type=Path)
+        command.add_argument("--pr", required=True, type=int)
+        if name == "update":
+            command.add_argument(
+                "--expected-revision", required=True, type=int
+            )
+    return parser
+
+
+def main(argv=None):
+    parser = create_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "read":
+            result = read_state(args.repo, args.pr)
+        elif args.command == "init":
+            result = initialize_state(
+                args.repo,
+                args.pr,
+                _read_input(),
+            )
+        else:
+            result = update_state(
+                args.repo,
+                args.pr,
+                args.expected_revision,
+                _read_input(),
+            )
+    except ContextStoreError as error:
+        parser.exit(2, f"error: {error}\n")
+    json.dump(result, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

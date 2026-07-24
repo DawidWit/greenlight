@@ -4,7 +4,10 @@ import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from unittest import mock
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -464,3 +467,101 @@ class MutationTests(unittest.TestCase):
                     context_store.initialize_state(repository, 17, initial)
 
             self.assertFalse(state_path.exists())
+
+
+class CliTests(unittest.TestCase):
+    def test_read_missing_state_prints_null(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = context_store.main(
+                    ["read", "--repo", str(repository), "--pr", "17"]
+                )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue()), None)
+
+    def test_init_read_and_update_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(
+                local_path=str(repository.resolve())
+            )
+            updated = valid_state(
+                revision=1,
+                local_path=str(repository.resolve()),
+            )
+            updated["phase"] = "baseline"
+
+            with patch.object(
+                context_store.sys,
+                "stdin",
+                StringIO(json.dumps(initial)),
+            ), redirect_stdout(StringIO()):
+                self.assertEqual(
+                    context_store.main(
+                        [
+                            "init",
+                            "--repo",
+                            str(repository),
+                            "--pr",
+                            "17",
+                        ]
+                    ),
+                    0,
+                )
+            with patch.object(
+                context_store.sys,
+                "stdin",
+                StringIO(json.dumps(updated)),
+            ), redirect_stdout(StringIO()):
+                self.assertEqual(
+                    context_store.main(
+                        [
+                            "update",
+                            "--repo",
+                            str(repository),
+                            "--pr",
+                            "17",
+                            "--expected-revision",
+                            "0",
+                        ]
+                    ),
+                    0,
+                )
+            state = context_store.read_state(repository, 17)
+        self.assertEqual(state["revision"], 1)
+        self.assertEqual(state["phase"], "baseline")
+
+    def test_cli_reports_revision_conflict_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            context_store.initialize_state(
+                repository,
+                17,
+                valid_state(local_path=str(repository.resolve())),
+            )
+            updated = valid_state(
+                revision=1,
+                local_path=str(repository.resolve()),
+            )
+            stderr = StringIO()
+            with patch.object(
+                context_store.sys,
+                "stdin",
+                StringIO(json.dumps(updated)),
+            ), redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+                context_store.main(
+                    [
+                        "update",
+                        "--repo",
+                        str(repository),
+                        "--pr",
+                        "17",
+                        "--expected-revision",
+                        "5",
+                    ]
+                )
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("revision", stderr.getvalue().lower())
+        self.assertNotIn("Traceback", stderr.getvalue())
