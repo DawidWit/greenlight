@@ -17,19 +17,70 @@ class SkillContractTests(unittest.TestCase):
         self.assertTrue(self.text.startswith("---\n"))
         frontmatter = self.text.split("---", 2)[1]
         self.assertRegex(frontmatter, r"(?m)^name: apply-pr-reviews$")
-        self.assertRegex(
-            frontmatter,
-            r"(?m)^description: .+Use when .+",
-        )
+        self.assertRegex(frontmatter, r"(?m)^description: Use when .+")
         self.assertNotIn("$ARGUMENTS", self.text)
 
-    def test_contains_mutation_boundary_before_commit_and_push(self):
+    def test_uses_full_superpowers_structure(self):
+        required_headings = (
+            "## Overview",
+            "## Core Principle",
+            "## The Iron Law",
+            "## The Process",
+            "## Human Decision Gate",
+            "## Local Decision Ledger",
+            "## Review Disposition Reference",
+            "## Common Rationalizations",
+            "## Quick Reference",
+            "## Red Flags - STOP",
+            "## Common Mistakes",
+            "## The Bottom Line",
+        )
+        positions = [self.text.index(heading) for heading in required_headings]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_contains_exact_iron_law(self):
+        self.assertIn(
+            "NO COMMIT OR PUSH WITHOUT AN APPROVED, CURRENT PACKET",
+            self.text,
+        )
+
+    def test_human_decision_contract_is_visible_and_scoped(self):
+        for phrase in (
+            "HUMAN DECISION REQUIRED",
+            "Decision:",
+            "Why this cannot be decided safely:",
+            "Recommendation:",
+            "Options:",
+            "Paused scope:",
+            "continue independent PRs",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), self.text.lower())
+
+    def test_approval_boundary_precedes_git_mutations(self):
         boundary = re.search(
-            r"(?is)mutation boundary.*?approval.*?git add.*?"
+            r"(?is)the iron law.*?approval.*?git add.*?"
             r"git commit.*?git push",
             self.text,
         )
         self.assertIsNotNone(boundary)
+
+    def test_requires_private_takeover_context(self):
+        for phrase in (
+            "scripts/context_store.py",
+            "git rev-parse --git-common-dir",
+            "state.json",
+            "expected revision",
+            "decision history",
+            "load existing local context",
+            "revalidate",
+            "schema_version",
+            "review_ledger",
+            "pending_decisions",
+            "publication",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.text.lower())
 
     def test_forbids_unrequested_github_mutations(self):
         for phrase in (
