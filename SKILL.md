@@ -95,6 +95,17 @@ verified batch.
 
 Always persist the pending approval decision first and render the complete gate;
 never merely summarize either step, even when asked to commit or push first.
+Store the unanswered record in `pending_decisions` with `question` set to
+`Approve this exact commit and push for this PR?`, the three `options` and
+`recommendation` shown below, `scope` set to `This PR only.`, and
+`packet_identity` containing PR head SHA, diff, files, commit message, and push
+target. The question must be inside the stored record, not only in the displayed
+gate. Persisting only the approval packet is insufficient.
+Do not show the gate unless the stored `pending_decisions` entry itself contains
+all five fields: `question`, `options`, `recommendation`, `scope`, and
+`packet_identity`. When stating exact actions, name all five stored fields;
+saying only that the decision was persisted or listing only packet identity is
+insufficient.
 
 Re-check the remote head SHA. Persist the pending decision, then show:
 

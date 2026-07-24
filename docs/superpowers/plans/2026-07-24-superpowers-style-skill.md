@@ -16,6 +16,10 @@
 - Never commit, push, or synchronize local decision state.
 - Never store credentials, environment variables, authentication output, or secret-shaped fields.
 - Require a current exact approval packet before `git add`, `git commit`, or `git push`.
+- The target skill's Iron Law governs runtime use of the completed
+  `apply-pr-reviews` skill on pull requests. It does not prohibit local
+  implementation commits required by this plan when the human-selected
+  Subagent-Driven workflow authorizes them.
 - Never force-push.
 - Never reply to or resolve review threads, post PR comments, approve, merge, or close a PR without a separate explicit request.
 - Keep `SKILL.md` below 500 lines.
@@ -1471,6 +1475,36 @@ Replace `test_frontmatter_is_portable_and_discoverable` and add new tests in
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, self.text.lower())
+
+    def test_publishing_pressure_cannot_summarize_approval_gate(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Always persist the pending approval decision first and render the "
+            "complete gate; never merely summarize either step, even when asked "
+            "to commit or push first.",
+            normalized,
+        )
+
+    def test_publish_approval_persists_decision_record_not_just_packet(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Store the unanswered record in `pending_decisions` with `question` "
+            "set to `Approve this exact commit and push for this PR?`, the three "
+            "`options` and `recommendation` shown below, `scope` set to `This PR "
+            "only.`, and `packet_identity` containing PR head SHA, diff, files, "
+            "commit message, and push target. The question must be inside the "
+            "stored record, not only in the displayed gate. Persisting only the "
+            "approval packet is insufficient.",
+            normalized,
+        )
+        self.assertIn(
+            "Do not show the gate unless the stored `pending_decisions` entry "
+            "itself contains all five fields: `question`, `options`, "
+            "`recommendation`, `scope`, and `packet_identity`. When stating exact "
+            "actions, name all five stored fields; saying only that the decision "
+            "was persisted or listing only packet identity is insufficient.",
+            normalized,
+        )
 ```
 
 Replace the old mutation-boundary test with
@@ -1589,6 +1623,20 @@ Exclude unsafe changes and changes that introduce failures. Persist every
 verified batch.
 
 ### Phase 5: Request Approval
+
+Always persist the pending approval decision first and render the complete gate;
+never merely summarize either step, even when asked to commit or push first.
+Store the unanswered record in `pending_decisions` with `question` set to
+`Approve this exact commit and push for this PR?`, the three `options` and
+`recommendation` shown below, `scope` set to `This PR only.`, and
+`packet_identity` containing PR head SHA, diff, files, commit message, and push
+target. The question must be inside the stored record, not only in the displayed
+gate. Persisting only the approval packet is insufficient.
+Do not show the gate unless the stored `pending_decisions` entry itself contains
+all five fields: `question`, `options`, `recommendation`, `scope`, and
+`packet_identity`. When stating exact actions, name all five stored fields;
+saying only that the decision was persisted or listing only packet identity is
+insufficient.
 
 Re-check the remote head SHA. Persist the pending decision, then show:
 

@@ -119,6 +119,27 @@ class SkillContractTests(unittest.TestCase):
             normalized,
         )
 
+    def test_publish_approval_persists_decision_record_not_just_packet(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Store the unanswered record in `pending_decisions` with `question` "
+            "set to `Approve this exact commit and push for this PR?`, the three "
+            "`options` and `recommendation` shown below, `scope` set to `This PR "
+            "only.`, and `packet_identity` containing PR head SHA, diff, files, "
+            "commit message, and push target. The question must be inside the "
+            "stored record, not only in the displayed gate. Persisting only the "
+            "approval packet is insufficient.",
+            normalized,
+        )
+        self.assertIn(
+            "Do not show the gate unless the stored `pending_decisions` entry "
+            "itself contains all five fields: `question`, `options`, "
+            "`recommendation`, `scope`, and `packet_identity`. When stating exact "
+            "actions, name all five stored fields; saying only that the decision "
+            "was persisted or listing only packet identity is insufficient.",
+            normalized,
+        )
+
     def test_is_concise_and_has_no_template_placeholders(self):
         self.assertLess(len(self.lines), 500)
         self.assertNotIn("TODO", self.text)
