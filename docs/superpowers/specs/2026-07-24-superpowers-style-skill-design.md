@@ -248,7 +248,8 @@ tool rather than editing ledger files directly. The tool must:
 - set directory permissions to `0700` and files to `0600` where supported;
 - reject stale writes through an expected-revision check;
 - print the current snapshot for agent takeover;
-- never read or write outside the resolved Git common directory;
+- accept state-update payloads only through standard input;
+- never store or modify context outside the resolved Git common directory;
 - never store credentials, environment variables, or authentication output.
 
 Always release the lock in a `finally` path. Never break an existing or stale
