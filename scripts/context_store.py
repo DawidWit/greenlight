@@ -273,10 +273,26 @@ def _validate_repository_path(state, repo_path):
 
 
 def _set_private_mode(path, mode):
-    try:
-        os.chmod(path, mode)
-    except (NotImplementedError, PermissionError):
-        pass
+    if os.name != "posix":
+        return
+    os.chmod(path, mode)
+
+
+def _push_target(state):
+    pull_request = state["pull_request"]
+    return (
+        pull_request["head_repository"],
+        pull_request["head_branch"],
+        pull_request["head_sha"],
+    )
+
+
+def _has_current_invalidation_event(old_history, new_history, revision):
+    return any(
+        decision["decision_type"] == "head-sha-invalidated"
+        and decision["revision"] == revision
+        for decision in new_history[len(old_history) :]
+    )
 
 
 @contextmanager
@@ -391,11 +407,9 @@ def update_state(
             raise StateValidationError(
                 "decision_history must preserve its existing prefix."
             )
-        old_sha = current["pull_request"]["head_sha"]
-        new_sha = state["pull_request"]["head_sha"]
         current_approval = current["approval"]
         if (
-            old_sha != new_sha
+            _push_target(current) != _push_target(state)
             and isinstance(current_approval, dict)
             and current_approval.get("valid") is True
         ):
@@ -403,13 +417,13 @@ def update_state(
             if (
                 not isinstance(approval, dict)
                 or approval.get("valid") is not False
-                or not new_history
-                or new_history[-1]["decision_type"]
-                != "head-sha-invalidated"
+                or not _has_current_invalidation_event(
+                    old_history, new_history, state["revision"]
+                )
             ):
                 raise StateValidationError(
-                    "A head SHA change must invalidate approval and append "
-                    "a head-sha-invalidated decision."
+                    "A push target change must invalidate approval and append "
+                    "a current-revision head-sha-invalidated decision."
                 )
         _atomic_write(state_dir / STATE_FILENAME, state)
     return state

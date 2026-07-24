@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -362,3 +363,104 @@ class MutationTests(unittest.TestCase):
             )
 
             self.assertFalse(result["approval"]["valid"])
+
+    def test_head_change_requires_a_new_current_revision_invalidation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            initial["approval"] = {
+                "valid": True,
+                "head_sha": "a" * 40,
+            }
+            initial["decision_history"].append(
+                decision_event(
+                    revision=0,
+                    decision_type="head-sha-invalidated",
+                    answer="Previous approval invalidated",
+                    transition="approval -> evaluate",
+                )
+            )
+            context_store.initialize_state(repository, 17, initial)
+
+            reused_event = valid_state(
+                revision=1,
+                head_sha="b" * 40,
+                local_path=str(repository.resolve()),
+            )
+            reused_event["approval"] = {
+                "valid": False,
+                "head_sha": "a" * 40,
+            }
+            reused_event["decision_history"] = initial["decision_history"]
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(repository, 17, 0, reused_event)
+
+    def test_push_target_change_invalidates_existing_approval(self):
+        for field, value in (
+            ("head_repository", "fork/widgets"),
+            ("head_branch", "feature/other-parser"),
+        ):
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as directory:
+                    repository = create_git_repository(directory)
+                    initial = valid_state(
+                        local_path=str(repository.resolve())
+                    )
+                    initial["approval"] = {
+                        "valid": True,
+                        "head_sha": "a" * 40,
+                    }
+                    context_store.initialize_state(repository, 17, initial)
+
+                    unsafe = valid_state(
+                        revision=1,
+                        local_path=str(repository.resolve()),
+                    )
+                    unsafe["pull_request"][field] = value
+                    unsafe["approval"] = initial["approval"]
+                    with self.assertRaises(context_store.StateValidationError):
+                        context_store.update_state(repository, 17, 0, unsafe)
+
+                    safe = valid_state(
+                        revision=1,
+                        local_path=str(repository.resolve()),
+                    )
+                    safe["pull_request"][field] = value
+                    safe["approval"] = {
+                        "valid": False,
+                        "head_sha": "a" * 40,
+                    }
+                    safe["decision_history"].append(
+                        decision_event(
+                            revision=1,
+                            decision_type="head-sha-invalidated",
+                            answer="Approval invalidated",
+                            transition="approval -> evaluate",
+                        )
+                    )
+
+                    result = context_store.update_state(
+                        repository, 17, 0, safe
+                    )
+
+                    self.assertFalse(result["approval"]["valid"])
+
+    @unittest.skipIf(os.name == "nt", "Windows does not use POSIX modes")
+    def test_initialize_fails_closed_when_private_mode_cannot_be_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            state_path = (
+                context_store.state_directory(repository, 17) / "state.json"
+            )
+
+            with mock.patch.object(
+                context_store.os,
+                "chmod",
+                side_effect=PermissionError("chmod denied"),
+            ):
+                with self.assertRaises(PermissionError):
+                    context_store.initialize_state(repository, 17, initial)
+
+            self.assertFalse(state_path.exists())

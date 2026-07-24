@@ -601,7 +601,8 @@ git commit -m "feat: add local PR context schema"
 
 - [ ] **Step 1: Add failing mutation tests**
 
-Append these cases to `tests/test_context_store.py`:
+Append these cases to `tests/test_context_store.py` (and import `mock` with
+`from unittest import mock`):
 
 ```python
 class MutationTests(unittest.TestCase):
@@ -748,6 +749,103 @@ class MutationTests(unittest.TestCase):
             )
 
             self.assertFalse(result["approval"]["valid"])
+
+    def test_head_change_requires_a_new_current_revision_invalidation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            initial["approval"] = {"valid": True, "head_sha": "a" * 40}
+            initial["decision_history"].append(
+                decision_event(
+                    revision=0,
+                    decision_type="head-sha-invalidated",
+                    answer="Previous approval invalidated",
+                    transition="approval -> evaluate",
+                )
+            )
+            context_store.initialize_state(repository, 17, initial)
+
+            reused_event = valid_state(
+                revision=1,
+                head_sha="b" * 40,
+                local_path=str(repository.resolve()),
+            )
+            reused_event["approval"] = {
+                "valid": False,
+                "head_sha": "a" * 40,
+            }
+            reused_event["decision_history"] = initial["decision_history"]
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(repository, 17, 0, reused_event)
+
+    def test_push_target_change_invalidates_existing_approval(self):
+        for field, value in (
+            ("head_repository", "fork/widgets"),
+            ("head_branch", "feature/other-parser"),
+        ):
+            with self.subTest(field=field):
+                with tempfile.TemporaryDirectory() as directory:
+                    repository = create_git_repository(directory)
+                    initial = valid_state(
+                        local_path=str(repository.resolve())
+                    )
+                    initial["approval"] = {
+                        "valid": True,
+                        "head_sha": "a" * 40,
+                    }
+                    context_store.initialize_state(repository, 17, initial)
+
+                    unsafe = valid_state(
+                        revision=1,
+                        local_path=str(repository.resolve()),
+                    )
+                    unsafe["pull_request"][field] = value
+                    unsafe["approval"] = initial["approval"]
+                    with self.assertRaises(context_store.StateValidationError):
+                        context_store.update_state(repository, 17, 0, unsafe)
+
+                    safe = valid_state(
+                        revision=1,
+                        local_path=str(repository.resolve()),
+                    )
+                    safe["pull_request"][field] = value
+                    safe["approval"] = {
+                        "valid": False,
+                        "head_sha": "a" * 40,
+                    }
+                    safe["decision_history"].append(
+                        decision_event(
+                            revision=1,
+                            decision_type="head-sha-invalidated",
+                            answer="Approval invalidated",
+                            transition="approval -> evaluate",
+                        )
+                    )
+                    result = context_store.update_state(
+                        repository, 17, 0, safe
+                    )
+
+                    self.assertFalse(result["approval"]["valid"])
+
+    @unittest.skipIf(os.name == "nt", "Windows does not use POSIX modes")
+    def test_initialize_fails_closed_when_private_mode_cannot_be_set(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            state_path = (
+                context_store.state_directory(repository, 17) / "state.json"
+            )
+
+            with mock.patch.object(
+                context_store.os,
+                "chmod",
+                side_effect=PermissionError("chmod denied"),
+            ):
+                with self.assertRaises(PermissionError):
+                    context_store.initialize_state(repository, 17, initial)
+
+            self.assertFalse(state_path.exists())
 ```
 
 - [ ] **Step 2: Run mutation tests and verify RED**
@@ -794,10 +892,26 @@ def _validate_repository_path(state, repo_path):
 
 
 def _set_private_mode(path, mode):
-    try:
-        os.chmod(path, mode)
-    except (NotImplementedError, PermissionError):
-        pass
+    if os.name != "posix":
+        return
+    os.chmod(path, mode)
+
+
+def _push_target(state):
+    pull_request = state["pull_request"]
+    return (
+        pull_request["head_repository"],
+        pull_request["head_branch"],
+        pull_request["head_sha"],
+    )
+
+
+def _has_current_invalidation_event(old_history, new_history, revision):
+    return any(
+        decision["decision_type"] == "head-sha-invalidated"
+        and decision["revision"] == revision
+        for decision in new_history[len(old_history) :]
+    )
 
 
 @contextmanager
@@ -912,11 +1026,9 @@ def update_state(
             raise StateValidationError(
                 "decision_history must preserve its existing prefix."
             )
-        old_sha = current["pull_request"]["head_sha"]
-        new_sha = state["pull_request"]["head_sha"]
         current_approval = current["approval"]
         if (
-            old_sha != new_sha
+            _push_target(current) != _push_target(state)
             and isinstance(current_approval, dict)
             and current_approval.get("valid") is True
         ):
@@ -924,13 +1036,13 @@ def update_state(
             if (
                 not isinstance(approval, dict)
                 or approval.get("valid") is not False
-                or not new_history
-                or new_history[-1]["decision_type"]
-                != "head-sha-invalidated"
+                or not _has_current_invalidation_event(
+                    old_history, new_history, state["revision"]
+                )
             ):
                 raise StateValidationError(
-                    "A head SHA change must invalidate approval and append "
-                    "a head-sha-invalidated decision."
+                    "A push target change must invalidate approval and append "
+                    "a current-revision head-sha-invalidated decision."
                 )
         _atomic_write(state_dir / STATE_FILENAME, state)
     return state
