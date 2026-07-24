@@ -37,8 +37,11 @@ FORBIDDEN_KEY = re.compile(
     re.IGNORECASE,
 )
 FORBIDDEN_NORMALIZED_KEYS = {
+    "env",
     "environment",
     "environmentvariables",
+    "auth",
+    "authentication",
     "authenticationoutput",
     "authoutput",
 }

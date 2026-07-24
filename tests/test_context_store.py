@@ -240,9 +240,20 @@ class SchemaTests(unittest.TestCase):
     def test_allows_legitimate_evidence_fields(self):
         state = valid_state()
         state["verification"]["evidence"] = {
-            "environmental_impact": "none"
+            "environmental_impact": "none",
+            "authentication_required": False,
         }
         self.assertIs(context_store.validate_state(state, 17), state)
+
+    def test_rejects_bare_environment_and_authentication_maps_recursively(self):
+        for key in ("env", "auth", "authentication"):
+            with self.subTest(key=key):
+                state = valid_state()
+                state["verification"]["nested"] = [
+                    {"evidence": ["safe"], key: {"value": "forbidden"}}
+                ]
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(state, 17)
 
     def test_missing_state_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
