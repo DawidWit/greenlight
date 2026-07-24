@@ -229,9 +229,13 @@ def validate_state(state, expected_pr=None):
 
 
 def read_state(repo_path, pr_number, *, runner=run_command):
-    path = state_directory(repo_path, pr_number, runner=runner) / STATE_FILENAME
+    directory = state_directory(repo_path, pr_number, runner=runner)
+    path = directory / STATE_FILENAME
     if not path.exists():
         return None
+    path = path.resolve()
+    if path.parent != directory:
+        raise StateValidationError("State file escaped the PR state directory.")
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:

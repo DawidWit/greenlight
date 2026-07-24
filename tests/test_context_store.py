@@ -199,3 +199,20 @@ class SchemaTests(unittest.TestCase):
             result = context_store.read_state(repository, 17, runner=runner)
 
             self.assertIsNone(result)
+
+    @unittest.skipIf(os.name == "nt", "symlink permissions vary on Windows")
+    def test_rejects_state_file_symlink_outside_pr_state_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory, "repo")
+            common = repository / ".git"
+            outside = Path(directory, "outside.json")
+            repository.mkdir()
+            common.mkdir()
+            outside.write_text(json.dumps(valid_state()), encoding="utf-8")
+            state = common / "apply-pr-reviews" / "pr-17"
+            state.mkdir(parents=True)
+            (state / "state.json").symlink_to(outside)
+            runner = RecordingRunner(str(common))
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.read_state(repository, 17, runner=runner)
