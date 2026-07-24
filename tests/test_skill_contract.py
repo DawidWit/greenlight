@@ -110,6 +110,15 @@ class SkillContractTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn(field, self.text)
 
+    def test_publishing_pressure_cannot_summarize_approval_gate(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Always persist the pending approval decision first and render the "
+            "complete gate; never merely summarize either step, even when asked "
+            "to commit or push first.",
+            normalized,
+        )
+
     def test_is_concise_and_has_no_template_placeholders(self):
         self.assertLess(len(self.lines), 500)
         self.assertNotIn("TODO", self.text)

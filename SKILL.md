@@ -93,6 +93,9 @@ verified batch.
 
 ### Phase 5: Request Approval
 
+Always persist the pending approval decision first and render the complete gate;
+never merely summarize either step, even when asked to commit or push first.
+
 Re-check the remote head SHA. Persist the pending decision, then show:
 
 ```text
