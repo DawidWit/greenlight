@@ -1,0 +1,4 @@
+interface:
+  display_name: "Apply PR Reviews"
+  short_description: "Apply actionable PR feedback safely"
+  default_prompt: "Use $apply-pr-reviews to process review feedback in my configured repositories."
