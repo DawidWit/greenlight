@@ -2129,3 +2129,71 @@ run fresh-context pressure evaluations for negative publish answers, stale or
 self-asserted fingerprints, and requests to move corrupt state directly.
 Finally run the full unit suite, compilation, top-level and new-command CLI help,
 the skill validator, `git diff --check`, and a branch self-review before commit.
+
+## Canonical Publication Lifecycle Hardening Addendum
+
+This addendum supersedes all older schema, approval-choice, fingerprint,
+recovery, and publication-lifecycle details in this historical plan.
+
+### RED
+
+Add focused regressions for:
+
+- schema version 3 canonical publish choices represented as ordered
+  `{outcome, label}` objects, including rejection of reordered, duplicate,
+  unknown, unselected, and label/outcome-mismatched choices;
+- exact approved, rejected, and changes-requested branching, with valid
+  approval linked to the same exact choice and packet;
+- line-anchored sensitive assignments and headers, fully quoted safe sentinels,
+  descriptive prose, and unsafe suffixes after safe words;
+- a clean real index before preapproval, a temporary-index immutable working
+  snapshot, exact real-index packet equality after approval, unstaged drift,
+  restaged drift, unrelated staged paths, and final commit-tree equality;
+- canonical recovery question, ordered choices, recommendation, scope, selected
+  `backup-authorized` label/outcome, normal-state refusal, and complete marker
+  plus first-fresh-history evidence;
+- real-Git `committed` then `pushed` transitions from approved head H to commit
+  C, including parent, message, path, tree, remote head, retained pre-commit
+  packet, and invalid transition checks.
+
+Retain the focused RED failure output before implementation.
+
+### GREEN
+
+Implement schema version 3 with exact canonical publish and recovery choice
+objects. Bind the selected label to its matching typed outcome everywhere:
+pending decisions, history, approval, recovery marker, and fresh recovery
+history.
+
+Fingerprint working changes from a temporary Git index and immutable tree while
+requiring the real index to be empty. After approval, fingerprint the complete
+real index with `--source index`; require exact packet equality and reject extra
+staged paths. Validate the committed tree against the approved canonical
+fingerprint rather than reading mutable working paths.
+
+Represent publication as two checkpoints. `committed` retains approval for
+pre-commit H while recording workspace base H/head C and commit C before any
+push. `pushed` is allowed only after a normal push and remote-head verification,
+with workspace/PR/commit/pushed SHA coherent at C. Reject direct-to-pushed,
+regressed, mutated, or otherwise incoherent transitions.
+
+Recognize sensitive assignments and headers only as true lines. Treat a safe
+sentinel as safe only when it is the entire optionally matched-quoted value.
+Keep credential-shaped values unsafe while allowing descriptive prose.
+
+Permit recovery only for the exact canonical `backup-authorized` choice and
+refuse the canonical `leave-untouched` choice without mutation. Refuse recovery
+of normally valid state and persist the full canonical decision evidence in the
+marker and first fresh history entry.
+
+Update `SKILL.md` and the design specification with the same schema, snapshot,
+choice, recovery, and publication state machine.
+
+### Verification
+
+Run focused context-store and static skill-contract tests during GREEN. Run
+fresh-context pressure scenarios for publish-choice mismatches, commit/push
+lifecycle persistence, and recovery/index bypass attempts. Then run exactly one
+final complete unit-suite pass, followed by compilation, all CLI help commands,
+the skill validator, `git diff --check`, and a final diff/status review. Append
+all evidence to the ignored final-review report and create a new commit.

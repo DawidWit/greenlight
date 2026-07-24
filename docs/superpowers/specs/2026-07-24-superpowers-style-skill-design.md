@@ -78,7 +78,8 @@ Define `packet_identity` as exactly `head_repository`, `head_branch`,
 `head_sha`, `diff_sha256`, `included_files`, and `commit_message`.
 `diff_sha256` is a lowercase deterministic SHA-256 of canonical patch bytes,
 including untracked-file patches. Approval is current only while every field
-matches the current PR target and changes.
+matches the current PR target and changes before commit, or while an authorized
+commit/push lifecycle retains and validates that exact pre-commit packet.
 
 ## Process
 
@@ -134,12 +135,15 @@ before requesting approval. Exclude unsafe or unverifiable changes.
 
 ### Phase 5: Request Approval
 
-Re-check the PR head SHA. Run `context_store.py fingerprint` against the
-recorded isolated workspace and the exact included files. The command requires
+Re-check the PR head SHA and require the real index to be empty. Run
+`context_store.py fingerprint --source working` against the recorded isolated
+workspace and the exact included files. The command requires
 the workspace HEAD, `base_sha`, and packet `head_sha` to agree. It
 deterministically covers tracked changes, deletions, untracked files, file
 contents, and file modes, and rejects unchanged, missing, escaping, or
-unsupported paths.
+unsupported paths. Working mode uses a temporary Git index to write an
+immutable tree and does not mutate the real index or read included paths
+directly after snapshot creation.
 
 The canonical byte stream begins `apply-pr-reviews-change-v1\0`. For each
 sorted path, append path, base mode, base content, working mode, and working
@@ -162,13 +166,14 @@ Persist the decision request before showing it so a later agent can resume from
 the same evidence and paused scope.
 
 A valid approval is not a free-standing boolean. It has exactly `valid`,
-`packet_identity`, `decision_history_index`, and `human_answer`; it must link to
-an append-only `publish-approval` history entry containing the same complete
-packet and non-empty exact human answer. Initialization and takeover reject
-approval that lacks any part of that evidence. A publish decision also stores
-the exact question, two or three non-empty unique displayed options, an answer
-equal to exactly one option, and an `approved`, `rejected`, or
-`changes-requested` outcome.
+`packet_identity`, `decision_history_index`, `human_answer`, and `outcome`; it
+must link to an append-only `publish-approval` history entry containing the
+same complete packet and exact selected choice. The canonical ordered choice
+objects are `{approved, "Approve the exact displayed commit and push."}`,
+`{rejected, "Reject it and keep the verified diff local."}`, and
+`{changes-requested, "Request changes to the proposed work."}`. Initialization
+and takeover reject missing, reordered, duplicated, unknown, or unselected
+choices and any label/outcome mismatch.
 
 ### Phase 6: Commit and Push
 
@@ -183,8 +188,19 @@ included-file list, or commit message requires a current-revision
 history for audit, but never use it as publication authority. Reconcile,
 reverify, and obtain a newly linked human decision for the new packet.
 
-If it is unchanged, stage only displayed files, create the displayed commit,
-and push normally to the displayed branch. Never force-push.
+If unchanged, stage only included files. Run the same fingerprint operation
+with `--source index`; require the entire packet identity and immutable tree to
+equal the approved working snapshot, and reject extra staged paths. Create the
+displayed commit C whose direct parent is approved head H and whose changed
+paths, message, and tree match that snapshot.
+
+Persist a `committed` checkpoint before push. It retains the approved H packet
+and decision, records workspace base H/head C and commit C, keeps the PR head
+at H, and leaves pushed SHA and publication time null. Then push normally and
+re-check the remote branch head; never force-push. Only after it is C may the
+checkpoint transition to `pushed`, with workspace and PR head C, commit and
+pushed SHA C, and a publication timestamp. Direct-to-pushed transitions,
+regressions, and incoherent fields fail closed.
 
 Do not mutate review threads or other PR state after pushing.
 
@@ -268,8 +284,9 @@ Use exact nested shapes. Review entries contain `url`, `author`,
 contain all five fields `question`, `options`, `recommendation`, `scope`, and
 `packet_identity`; only non-publish decisions may use a null packet. Decision
 history has exact `question`, `outcome`, and `recovery` fields in addition to
-the existing evidence and `packet_identity`. Publication
-contains `commit_sha`, `pushed_sha`, `packet_identity`,
+the existing evidence and `packet_identity`. Publish and recovery options are
+canonical ordered objects with exactly `outcome` and `label`. Publication
+contains `status`, `commit_sha`, `pushed_sha`, `packet_identity`,
 `approval_decision_history_index`, `checks`, and `published_at`, and must link
 to retained approval and its exact publish decision.
 
@@ -290,7 +307,7 @@ For every decision-history entry, record:
 Add a deterministic `scripts/context_store.py` tool. Require agents to use the
 tool rather than editing ledger files directly. The tool must:
 
-- validate schema version 2, configured repository path, PR identity, and
+- validate schema version 3, configured repository path, PR identity, and
   isolated workspace identity;
 - acquire a PR-scoped lock with atomic directory creation;
 - re-check the expected revision after acquiring the lock;
@@ -303,7 +320,9 @@ tool rather than editing ledger files directly. The tool must:
 - never store secret-shaped keys or sensitive values, including raw
   environment/authentication output, authorization headers, cookies,
   credential assignments, private keys, or common credential formats;
-- allow safe summaries such as authentication success and check results;
+- allow descriptive prose and safe summaries such as authentication success
+  and check results, while recognizing assignments and headers only as complete
+  lines and safe sentinels only as the entire optionally quoted value;
 - compute canonical change fingerprints only from a matching isolated
   workspace;
 - recover authorized invalid state with a locked lexical move to a contained,
@@ -323,7 +342,9 @@ At the beginning of each PR:
 1. Read the local snapshot and decision history.
 2. Compare the recorded head SHA with the current remote head.
 3. Verify `repository.local_path` and the recorded workspace path and Git HEAD.
-4. Recompute the fingerprint for the recorded included files.
+4. Before commit, recompute the working fingerprint with an empty real index.
+   For committed or pushed state, validate the commit parent, message, paths,
+   tree, retained packet, and remote lifecycle checkpoint instead.
 5. Reuse verified evidence that still matches current code.
 6. Revalidate stale evidence and mark superseded conclusions explicitly.
 7. Preserve current human decisions when their assumptions still hold.
@@ -386,9 +407,13 @@ the identity of the work.
   overwrite, delete, repair, rename, or replace it automatically.
 - Because invalid state cannot safely persist its own pending record, treat
   this as the sole persistence-order exception: show the recovery gate first,
-  then, only after authorization, call `context_store.py recover`. Fresh
-  initialization must record the exact question, answer, and returned backup
-  identity as the first decision. Never move or edit invalid state directly.
+  then call `context_store.py recover` only for the exact canonical
+  `backup-authorized` label/outcome choice. The canonical `leave-untouched`
+  choice stops without mutation. Recovery refuses state that validates
+  normally and any mismatch in the canonical question, ordered choices,
+  recommendation, scope, label, or outcome. Fresh initialization must record
+  all canonical recovery evidence and the returned backup identity as its
+  first decision. Never move or edit invalid state directly.
 
 ## Rationalization Defense
 

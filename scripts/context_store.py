@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STORE_DIRECTORY = "apply-pr-reviews"
 STATE_FILENAME = "state.json"
 RECOVERY_FILENAME = "recovery.json"
@@ -112,15 +112,43 @@ DECISION_FIELDS = {
 WORKSPACE_FIELDS = {"kind", "path", "base_sha", "head_sha"}
 WORKSPACE_KINDS = {"worktree", "clone"}
 PUBLISH_OUTCOMES = {"approved", "rejected", "changes-requested"}
+CHOICE_FIELDS = {"outcome", "label"}
+PUBLISH_APPROVAL_QUESTION = "Approve this exact commit and push for this PR?"
+PUBLISH_RECOMMENDATION = (
+    "Approve only if the displayed evidence and target are correct."
+)
+DECISION_SCOPE = "This PR only."
+PUBLISH_CHOICES = (
+    ("approved", "Approve the exact displayed commit and push."),
+    ("rejected", "Reject it and keep the verified diff local."),
+    ("changes-requested", "Request changes to the proposed work."),
+)
+RECOVERY_QUESTION = "How should the preserved invalid local state be handled?"
+RECOVERY_RECOMMENDATION = (
+    "Leave it untouched until its provenance is understood."
+)
+RECOVERY_CHOICES = (
+    (
+        "leave-untouched",
+        "Leave the preserved state untouched and stop this PR.",
+    ),
+    (
+        "backup-authorized",
+        "Authorize moving the invalid state to a named private backup, then "
+        "initialize fresh state.",
+    ),
+)
 RECOVERY_FIELDS = {"backup_name", "backup_path"}
 BACKUP_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 APPROVAL_FIELDS = {
     "valid",
+    "outcome",
     "packet_identity",
     "decision_history_index",
     "human_answer",
 }
 PUBLICATION_FIELDS = {
+    "status",
     "commit_sha",
     "pushed_sha",
     "packet_identity",
@@ -128,13 +156,13 @@ PUBLICATION_FIELDS = {
     "checks",
     "published_at",
 }
-PUBLISH_APPROVAL_QUESTION = "Approve this exact commit and push for this PR?"
+PUBLICATION_STATUSES = {"committed", "pushed"}
 RAW_ENV_ASSIGNMENT = re.compile(
-    r"(?m)^[A-Z_][A-Z0-9_]{1,}\s*=\s*(?P<value>\S.*)$"
+    r"(?m)^\s*[A-Z_][A-Z0-9_]{1,}\s*=\s*(?P<value>.*?)\s*$"
 )
 SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:authorization|api[_ -]?key|client[_ -]?secret|"
-    r"password|secret|token|cookie)\b\s*[:=]\s*(?P<value>\S+)"
+    r"(?im)^\s*(?:authorization|api[_ -]?key|client[_ -]?secret|"
+    r"password|secret|token|cookie)\s*[:=]\s*(?P<value>.*?)\s*$"
 )
 SAFE_SENTINELS = {"none", "redacted", "<redacted>", "unset", "not-set"}
 SENSITIVE_VALUE_PATTERNS = (
@@ -254,11 +282,11 @@ def _reject_sensitive_content(value, path="state"):
             _reject_sensitive_content(nested, f"{path}[{index}]")
     elif isinstance(value, str):
         environment_values = [
-            match.group("value").strip().lower()
+            _normalized_assignment_value(match.group("value"))
             for match in RAW_ENV_ASSIGNMENT.finditer(value)
         ]
         assignment_values = [
-            match.group("value").strip().lower()
+            _normalized_assignment_value(match.group("value"))
             for match in SENSITIVE_ASSIGNMENT.finditer(value)
         ]
         has_raw_assignment = any(
@@ -269,6 +297,17 @@ def _reject_sensitive_content(value, path="state"):
             pattern.search(value) for pattern in SENSITIVE_VALUE_PATTERNS
         ):
             raise StateValidationError(f"Sensitive value at {path}.")
+
+
+def _normalized_assignment_value(value):
+    normalized = value.strip()
+    if (
+        len(normalized) >= 2
+        and normalized[0] == normalized[-1]
+        and normalized[0] in {"'", '"'}
+    ):
+        normalized = normalized[1:-1].strip()
+    return normalized.lower()
 
 
 def _require_exact_object(value, fields, path):
@@ -307,6 +346,29 @@ def _validate_string_list(
     return value
 
 
+def _choice_documents(canonical):
+    return [
+        {"outcome": outcome, "label": label}
+        for outcome, label in canonical
+    ]
+
+
+def _validate_canonical_choices(value, canonical, path):
+    expected = _choice_documents(canonical)
+    if value != expected:
+        raise StateValidationError(f"{path} must equal the canonical choices.")
+    for index, choice in enumerate(value):
+        _require_exact_object(choice, CHOICE_FIELDS, f"{path}[{index}]")
+    return value
+
+
+def _selected_choice_outcome(options, answer, path):
+    for choice in options:
+        if choice["label"] == answer:
+            return choice["outcome"]
+    raise StateValidationError(f"{path}.answer must select a displayed choice.")
+
+
 def _validate_packet_identity(packet, path):
     _require_exact_object(packet, PACKET_FIELDS, path)
     for field in ("head_repository", "head_branch", "commit_message"):
@@ -331,7 +393,7 @@ def _validate_packet_identity(packet, path):
     return packet
 
 
-def _validate_workspace_identity(workspace, pull_request):
+def _validate_workspace_identity(workspace):
     _require_exact_object(workspace, WORKSPACE_FIELDS, "workspace")
     if workspace["kind"] not in WORKSPACE_KINDS:
         raise StateValidationError("workspace.kind is invalid.")
@@ -345,13 +407,6 @@ def _validate_workspace_identity(workspace, pull_request):
         value = workspace[field]
         if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
             raise StateValidationError(f"workspace.{field} is invalid.")
-    if (
-        workspace["base_sha"] != pull_request["head_sha"]
-        or workspace["head_sha"] != pull_request["head_sha"]
-    ):
-        raise StateValidationError(
-            "workspace SHA identity must match pull_request.head_sha."
-        )
 
 
 def _workspace_head(workspace_path):
@@ -381,13 +436,15 @@ def _validate_workspace_runtime(state):
         raise StateValidationError(
             "Workspace HEAD does not match stored workspace.head_sha."
         )
+    if state["publication"] is not None:
+        _validate_committed_git_snapshot(state)
 
 
 def _current_packet_identity(state):
     return {
         "head_repository": state["pull_request"]["head_repository"],
         "head_branch": state["pull_request"]["head_branch"],
-        "head_sha": state["pull_request"]["head_sha"],
+        "head_sha": state["workspace"]["base_sha"],
         "diff_sha256": state["changes"]["diff_sha256"],
         "included_files": state["changes"]["files"],
         "commit_message": state["changes"]["commit_message"],
@@ -436,13 +493,6 @@ def _validate_pending_decisions(state):
         _require_exact_object(decision, PENDING_DECISION_FIELDS, path)
         for field in ("question", "recommendation", "scope"):
             _require_nonempty_string(decision[field], f"{path}.{field}")
-        _validate_string_list(
-            decision["options"],
-            f"{path}.options",
-            minimum=2,
-            maximum=3,
-            unique=True,
-        )
         packet = decision["packet_identity"]
         if packet is not None:
             _validate_packet_identity(packet, f"{path}.packet_identity")
@@ -450,10 +500,29 @@ def _validate_pending_decisions(state):
                 raise StateValidationError(
                     f"{path}.packet_identity is not current."
                 )
-        if decision["question"] == PUBLISH_APPROVAL_QUESTION and packet is None:
-            raise StateValidationError(
-                f"{path}.packet_identity is required for publish approval."
+            if (
+                decision["question"] != PUBLISH_APPROVAL_QUESTION
+                or decision["recommendation"] != PUBLISH_RECOMMENDATION
+                or decision["scope"] != DECISION_SCOPE
+            ):
+                raise StateValidationError(
+                    f"{path} must equal the canonical publish gate."
+                )
+            _validate_canonical_choices(
+                decision["options"], PUBLISH_CHOICES, f"{path}.options"
             )
+        else:
+            _validate_string_list(
+                decision["options"],
+                f"{path}.options",
+                minimum=2,
+                maximum=3,
+                unique=True,
+            )
+            if decision["question"] == PUBLISH_APPROVAL_QUESTION:
+                raise StateValidationError(
+                    f"{path}.packet_identity is required for publish approval."
+                )
 
 
 def _validate_decision_history(state):
@@ -480,8 +549,9 @@ def _validate_decision_history(state):
             "transition",
         ):
             _require_nonempty_string(decision[field], f"{path}.{field}")
-        for field in ("evidence", "options"):
-            _validate_string_list(decision[field], f"{path}.{field}")
+        _validate_string_list(decision["evidence"], f"{path}.evidence")
+        if not isinstance(decision["options"], list):
+            raise StateValidationError(f"{path}.options must be a list.")
         if not isinstance(decision["question"], str):
             raise StateValidationError(f"{path}.question must be a string.")
         packet = decision["packet_identity"]
@@ -505,33 +575,54 @@ def _validate_decision_history(state):
                 raise StateValidationError(
                     f"{path}.question is not the publish approval question."
                 )
-            _validate_string_list(
-                decision["options"],
-                f"{path}.options",
-                minimum=2,
-                maximum=3,
-                unique=True,
-            )
-            if decision["answer"] not in decision["options"]:
+            if (
+                decision["recommendation"] != PUBLISH_RECOMMENDATION
+                or decision["scope"] != DECISION_SCOPE
+            ):
                 raise StateValidationError(
-                    f"{path}.answer must equal one displayed option."
+                    f"{path} must preserve the canonical publish gate."
                 )
-            if outcome not in PUBLISH_OUTCOMES:
-                raise StateValidationError(f"{path}.outcome is invalid.")
+            options = _validate_canonical_choices(
+                decision["options"], PUBLISH_CHOICES, f"{path}.options"
+            )
+            selected_outcome = _selected_choice_outcome(
+                options, decision["answer"], path
+            )
+            if outcome != selected_outcome:
+                raise StateValidationError(
+                    f"{path}.outcome does not match the selected choice."
+                )
             if recovery is not None:
                 raise StateValidationError(
                     f"{path}.recovery must be null for publish approval."
                 )
-        elif outcome is not None:
-            raise StateValidationError(
-                f"{path}.outcome is only valid for publish approval."
-            )
-        if decision["decision_type"] == "state-recovery":
-            _require_nonempty_string(decision["question"], f"{path}.question")
+        elif decision["decision_type"] == "state-recovery":
             if recovery is None:
                 raise StateValidationError(
                     f"{path}.recovery is required for state recovery."
                 )
+            if (
+                decision["question"] != RECOVERY_QUESTION
+                or decision["recommendation"] != RECOVERY_RECOMMENDATION
+                or decision["scope"] != DECISION_SCOPE
+            ):
+                raise StateValidationError(
+                    f"{path} must preserve the canonical recovery gate."
+                )
+            options = _validate_canonical_choices(
+                decision["options"], RECOVERY_CHOICES, f"{path}.options"
+            )
+            selected_outcome = _selected_choice_outcome(
+                options, decision["answer"], path
+            )
+            if outcome != selected_outcome or outcome != "backup-authorized":
+                raise StateValidationError(
+                    f"{path} requires the canonical backup authorization."
+                )
+        elif outcome is not None:
+            raise StateValidationError(
+                f"{path}.outcome is only valid for a typed human decision."
+            )
         elif recovery is not None:
             raise StateValidationError(
                 f"{path}.recovery is only valid for state recovery."
@@ -570,6 +661,8 @@ def _validate_approval(state):
     _require_exact_object(approval, APPROVAL_FIELDS, "approval")
     if not isinstance(approval["valid"], bool):
         raise StateValidationError("approval.valid must be a boolean.")
+    if approval["outcome"] not in PUBLISH_OUTCOMES:
+        raise StateValidationError("approval.outcome is invalid.")
     packet = _validate_packet_identity(
         approval["packet_identity"], "approval.packet_identity"
     )
@@ -583,6 +676,10 @@ def _validate_approval(state):
         packet,
         human_answer,
     )
+    if approval["outcome"] != linked_decision["outcome"]:
+        raise StateValidationError(
+            "Approval outcome does not match its selected publish choice."
+        )
     later_history = state["decision_history"][decision_index + 1 :]
     was_invalidated = any(
         decision["decision_type"] == "approval-invalidated"
@@ -597,7 +694,7 @@ def _validate_approval(state):
         raise StateValidationError(
             "Valid approval packet does not match current PR changes."
         )
-    if approval["valid"] and linked_decision["outcome"] != "approved":
+    if approval["valid"] and approval["outcome"] != "approved":
         raise StateValidationError(
             "approval.valid requires an approved publish outcome."
         )
@@ -614,12 +711,22 @@ def _validate_approval(state):
 def _validate_publication(state):
     publication = state["publication"]
     if publication is None:
+        pull_head = state["pull_request"]["head_sha"]
+        workspace = state["workspace"]
+        if (
+            workspace["base_sha"] != pull_head
+            or workspace["head_sha"] != pull_head
+        ):
+            raise StateValidationError(
+                "Pre-publication workspace SHAs must equal the PR head."
+            )
         return
     _require_exact_object(publication, PUBLICATION_FIELDS, "publication")
-    for field in ("commit_sha", "pushed_sha"):
-        value = publication[field]
-        if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
-            raise StateValidationError(f"publication.{field} is invalid.")
+    if publication["status"] not in PUBLICATION_STATUSES:
+        raise StateValidationError("publication.status is invalid.")
+    commit_sha = publication["commit_sha"]
+    if not isinstance(commit_sha, str) or not SHA_PATTERN.fullmatch(commit_sha):
+        raise StateValidationError("publication.commit_sha is invalid.")
     packet = _validate_packet_identity(
         publication["packet_identity"], "publication.packet_identity"
     )
@@ -648,18 +755,46 @@ def _validate_publication(state):
         "publication.checks",
         minimum=1,
     )
-    _require_nonempty_string(
-        publication["published_at"], "publication.published_at"
-    )
+    workspace = state["workspace"]
+    pull_head = state["pull_request"]["head_sha"]
+    if (
+        packet != _current_packet_identity(state)
+        or workspace["base_sha"] != packet["head_sha"]
+        or workspace["head_sha"] != commit_sha
+    ):
+        raise StateValidationError(
+            "Publication does not retain the approved pre-commit packet."
+        )
+    if publication["status"] == "committed":
+        if (
+            publication["pushed_sha"] is not None
+            or publication["published_at"] is not None
+            or pull_head != workspace["base_sha"]
+        ):
+            raise StateValidationError(
+                "Committed checkpoint has incoherent push or PR-head fields."
+            )
+    else:
+        if (
+            publication["pushed_sha"] != commit_sha
+            or pull_head != commit_sha
+        ):
+            raise StateValidationError(
+                "Pushed publication must advance the PR head to the commit."
+            )
+        _require_nonempty_string(
+            publication["published_at"], "publication.published_at"
+        )
 
 
-def _run_bytes(command):
+def _run_bytes(command, *, env=None):
     try:
         completed = subprocess.run(
             command,
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=env,
         )
     except FileNotFoundError as error:
         raise GitContextError(
@@ -696,7 +831,7 @@ def _validate_included_path(workspace, included_path):
     return target
 
 
-def _base_file_record(workspace, base_sha, included_path):
+def _tree_file_record(workspace, treeish, included_path):
     output = _run_bytes(
         [
             "git",
@@ -704,7 +839,7 @@ def _base_file_record(workspace, base_sha, included_path):
             str(workspace),
             "ls-tree",
             "-z",
-            base_sha,
+            treeish,
             "--",
             included_path,
         ]
@@ -724,7 +859,7 @@ def _base_file_record(workspace, base_sha, included_path):
         )
     if object_type != b"blob":
         raise StateValidationError(
-            f"Included base path is not a file: {included_path}"
+            f"Included tree path is not a file: {included_path}"
         )
     content = _run_bytes(
         ["git", "-C", str(workspace), "cat-file", "blob", object_id.decode()]
@@ -732,23 +867,201 @@ def _base_file_record(workspace, base_sha, included_path):
     return mode, content
 
 
-def _working_file_record(target, included_path):
+def _index_environment(index_path):
+    environment = os.environ.copy()
+    environment["GIT_INDEX_FILE"] = str(index_path)
+    return environment
+
+
+@contextmanager
+def _temporary_index(workspace, base_sha):
+    descriptor, index_name = tempfile.mkstemp(prefix="apply-pr-reviews-index.")
+    os.close(descriptor)
+    os.unlink(index_name)
+    index_path = Path(index_name)
+    environment = _index_environment(index_path)
     try:
-        metadata = os.lstat(target)
-    except FileNotFoundError:
-        return b"missing", b""
-    if stat.S_ISLNK(metadata.st_mode):
-        return b"120000", os.fsencode(os.readlink(target))
-    if not stat.S_ISREG(metadata.st_mode):
-        raise StateValidationError(
-            f"Included workspace path is not a regular file: {included_path}"
+        _run_bytes(
+            ["git", "-C", str(workspace), "read-tree", base_sha],
+            env=environment,
         )
-    mode = b"100755" if metadata.st_mode & stat.S_IXUSR else b"100644"
-    return mode, target.read_bytes()
+        yield environment
+    finally:
+        try:
+            index_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _index_changed_paths(workspace, base_sha, *, env=None):
+    output = _run_bytes(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            base_sha,
+            "--",
+        ],
+        env=env,
+    )
+    return sorted(
+        path.decode("utf-8", "surrogateescape")
+        for path in output.split(b"\0")
+        if path
+    )
+
+
+def _write_index_tree(workspace, *, env=None):
+    return _run_bytes(
+        ["git", "-C", str(workspace), "write-tree"],
+        env=env,
+    ).decode("ascii").strip()
+
+
+def _snapshot_working_tree(workspace, base_sha, included_files):
+    if _index_changed_paths(workspace, base_sha):
+        raise StateValidationError(
+            "The real Git index must be empty before working fingerprinting."
+        )
+    for included_path in included_files:
+        _validate_included_path(workspace, included_path)
+    with _temporary_index(workspace, base_sha) as environment:
+        literal_paths = [
+            f":(literal){included_path}" for included_path in included_files
+        ]
+        _run_bytes(
+            [
+                "git",
+                "-C",
+                str(workspace),
+                "add",
+                "-A",
+                "--",
+                *literal_paths,
+            ],
+            env=environment,
+        )
+        changed_paths = _index_changed_paths(
+            workspace, base_sha, env=environment
+        )
+        if changed_paths != included_files:
+            raise StateValidationError(
+                "Working snapshot changes do not equal included_files."
+            )
+        return _write_index_tree(workspace, env=environment)
+
+
+def _snapshot_real_index(workspace, base_sha, included_files):
+    for included_path in included_files:
+        _validate_included_path(workspace, included_path)
+    changed_paths = _index_changed_paths(workspace, base_sha)
+    if changed_paths != included_files:
+        raise StateValidationError(
+            "Staged paths do not exactly equal included_files."
+        )
+    return _write_index_tree(workspace)
 
 
 def _framed(label, content):
     return label + struct.pack(">Q", len(content)) + content
+
+
+def _canonical_tree_difference(
+    workspace,
+    base_tree,
+    snapshot_tree,
+    included_files,
+):
+    canonical = bytearray(b"apply-pr-reviews-change-v1\0")
+    for included_path in included_files:
+        base_mode, base_content = _tree_file_record(
+            workspace, base_tree, included_path
+        )
+        work_mode, work_content = _tree_file_record(
+            workspace, snapshot_tree, included_path
+        )
+        if base_mode == work_mode and base_content == work_content:
+            raise StateValidationError(
+                f"Included file is unchanged: {included_path}"
+            )
+        if base_mode == b"missing" and work_mode == b"missing":
+            raise StateValidationError(
+                f"Included file is missing: {included_path}"
+            )
+        path_bytes = included_path.encode("utf-8", "surrogateescape")
+        canonical.extend(_framed(b"P", path_bytes))
+        canonical.extend(_framed(b"M", base_mode))
+        canonical.extend(_framed(b"B", base_content))
+        canonical.extend(_framed(b"m", work_mode))
+        canonical.extend(_framed(b"W", work_content))
+    return bytes(canonical)
+
+
+def _tree_changed_paths(workspace, base_sha, commit_sha):
+    output = _run_bytes(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "diff",
+            "--name-only",
+            "-z",
+            base_sha,
+            commit_sha,
+            "--",
+        ]
+    )
+    return sorted(
+        path.decode("utf-8", "surrogateescape")
+        for path in output.split(b"\0")
+        if path
+    )
+
+
+def _validate_committed_git_snapshot(state):
+    workspace = Path(state["workspace"]["path"])
+    base_sha = state["workspace"]["base_sha"]
+    publication = state["publication"]
+    commit_sha = publication["commit_sha"]
+    parent_sha = run_command(
+        ["git", "-C", str(workspace), "rev-parse", f"{commit_sha}^"]
+    ).strip()
+    if parent_sha != base_sha:
+        raise StateValidationError(
+            "Published commit must directly follow the approved base SHA."
+        )
+    included_files = publication["packet_identity"]["included_files"]
+    if _tree_changed_paths(workspace, base_sha, commit_sha) != included_files:
+        raise StateValidationError(
+            "Published commit paths do not equal approved included_files."
+        )
+    commit_tree = run_command(
+        ["git", "-C", str(workspace), "rev-parse", f"{commit_sha}^{{tree}}"]
+    ).strip()
+    canonical = _canonical_tree_difference(
+        workspace,
+        base_sha,
+        commit_tree,
+        included_files,
+    )
+    if (
+        hashlib.sha256(canonical).hexdigest()
+        != publication["packet_identity"]["diff_sha256"]
+    ):
+        raise StateValidationError(
+            "Published commit tree does not match the approved fingerprint."
+        )
+    commit_message = run_command(
+        ["git", "-C", str(workspace), "show", "-s", "--format=%B", commit_sha]
+    ).rstrip("\n")
+    if commit_message != publication["packet_identity"]["commit_message"]:
+        raise StateValidationError(
+            "Published commit message does not match the approved packet."
+        )
 
 
 def compute_packet_identity(
@@ -761,6 +1074,7 @@ def compute_packet_identity(
     head_sha,
     commit_message,
     included_files,
+    source="working",
 ):
     workspace = Path(workspace_path).expanduser().resolve()
     if workspace_kind not in WORKSPACE_KINDS:
@@ -793,28 +1107,23 @@ def compute_packet_identity(
             "Workspace HEAD does not match the supplied base_sha."
         )
 
-    canonical = bytearray(b"apply-pr-reviews-change-v1\0")
     sorted_files = sorted(included_files)
-    for included_path in sorted_files:
-        target = _validate_included_path(workspace, included_path)
-        base_mode, base_content = _base_file_record(
-            workspace, base_sha, included_path
+    if source == "working":
+        snapshot_tree = _snapshot_working_tree(
+            workspace, base_sha, sorted_files
         )
-        work_mode, work_content = _working_file_record(target, included_path)
-        if base_mode == work_mode and base_content == work_content:
-            raise StateValidationError(
-                f"Included file is unchanged: {included_path}"
-            )
-        if base_mode == b"missing" and work_mode == b"missing":
-            raise StateValidationError(
-                f"Included file is missing: {included_path}"
-            )
-        path_bytes = included_path.encode("utf-8", "surrogateescape")
-        canonical.extend(_framed(b"P", path_bytes))
-        canonical.extend(_framed(b"M", base_mode))
-        canonical.extend(_framed(b"B", base_content))
-        canonical.extend(_framed(b"m", work_mode))
-        canonical.extend(_framed(b"W", work_content))
+    elif source == "index":
+        snapshot_tree = _snapshot_real_index(
+            workspace, base_sha, sorted_files
+        )
+    else:
+        raise StateValidationError("source must be working or index.")
+    canonical = _canonical_tree_difference(
+        workspace,
+        base_sha,
+        snapshot_tree,
+        sorted_files,
+    )
 
     final_head = run_command(
         ["git", "-C", str(workspace), "rev-parse", "HEAD"]
@@ -841,6 +1150,8 @@ def compute_packet_identity(
     return {
         "workspace": workspace_identity,
         "packet_identity": packet,
+        "snapshot_tree": snapshot_tree,
+        "source": source,
     }
 
 
@@ -891,7 +1202,7 @@ def validate_state(state, expected_pr=None):
     for key in ("url", "base_branch", "head_repository", "head_branch"):
         if not isinstance(pull_request[key], str) or not pull_request[key]:
             raise StateValidationError(f"pull_request.{key} is invalid.")
-    _validate_workspace_identity(state["workspace"], pull_request)
+    _validate_workspace_identity(state["workspace"])
     if not isinstance(state["decision_history"], list):
         raise StateValidationError("decision_history must be a list.")
     if not isinstance(state["verification"], dict):
@@ -909,7 +1220,13 @@ def validate_state(state, expected_pr=None):
     return state
 
 
-def read_state(repo_path, pr_number, *, runner=run_command):
+def _read_state_document(
+    repo_path,
+    pr_number,
+    *,
+    runner=run_command,
+    validate_runtime,
+):
     directory = state_directory(repo_path, pr_number, runner=runner)
     path = directory / STATE_FILENAME
     if not os.path.lexists(path):
@@ -927,8 +1244,18 @@ def read_state(repo_path, pr_number, *, runner=run_command):
         raise StateValidationError(f"Cannot read valid state: {path}") from error
     validate_state(state, pr_number)
     _validate_repository_path(state, repo_path)
-    _validate_workspace_runtime(state)
+    if validate_runtime:
+        _validate_workspace_runtime(state)
     return state
+
+
+def read_state(repo_path, pr_number, *, runner=run_command):
+    return _read_state_document(
+        repo_path,
+        pr_number,
+        runner=runner,
+        validate_runtime=True,
+    )
 
 
 def _utc_now():
@@ -1054,11 +1381,18 @@ def recover_state(
     backup_name,
     recovery_question,
     human_answer,
+    outcome,
     runner=run_command,
 ):
     _validate_backup_name(backup_name)
-    _require_nonempty_string(recovery_question, "recovery_question")
-    _require_nonempty_string(human_answer, "human_answer")
+    if (
+        recovery_question != RECOVERY_QUESTION
+        or human_answer != RECOVERY_CHOICES[1][1]
+        or outcome != RECOVERY_CHOICES[1][0]
+    ):
+        raise StateValidationError(
+            "Recovery requires the canonical backup-authorized choice."
+        )
     state_dir = state_directory(repo_path, pr_number, runner=runner)
     with pr_lock(state_dir):
         state_path = state_dir / STATE_FILENAME
@@ -1066,6 +1400,14 @@ def recover_state(
         marker_path = state_dir / RECOVERY_FILENAME
         if not os.path.lexists(state_path):
             raise StateValidationError("No lexical state.json entry to recover.")
+        try:
+            valid_state = read_state(repo_path, pr_number, runner=runner)
+        except ContextStoreError:
+            valid_state = None
+        if valid_state is not None:
+            raise StateValidationError(
+                "Recovery refuses state that validates normally for this PR."
+            )
         if os.path.lexists(backup_path):
             raise StateValidationError("Recovery backup already exists.")
         if os.path.lexists(marker_path):
@@ -1073,8 +1415,12 @@ def recover_state(
         result = {
             "backup_name": backup_name,
             "backup_path": str(backup_path),
-            "recovery_question": recovery_question,
-            "human_answer": human_answer,
+            "question": RECOVERY_QUESTION,
+            "options": _choice_documents(RECOVERY_CHOICES),
+            "recommendation": RECOVERY_RECOMMENDATION,
+            "answer": human_answer,
+            "outcome": outcome,
+            "scope": DECISION_SCOPE,
         }
         os.replace(state_path, backup_path)
         try:
@@ -1104,13 +1450,28 @@ def _read_recovery_marker(state_dir):
     required = {
         "backup_name",
         "backup_path",
-        "recovery_question",
-        "human_answer",
+        "question",
+        "options",
+        "recommendation",
+        "answer",
+        "outcome",
+        "scope",
     }
     _require_exact_object(marker, required, "recovery metadata")
     _validate_backup_name(marker["backup_name"])
-    for field in required:
+    for field in required - {"options"}:
         _require_nonempty_string(marker[field], f"recovery metadata.{field}")
+    _validate_canonical_choices(
+        marker["options"], RECOVERY_CHOICES, "recovery metadata.options"
+    )
+    if (
+        marker["question"] != RECOVERY_QUESTION
+        or marker["recommendation"] != RECOVERY_RECOMMENDATION
+        or marker["answer"] != RECOVERY_CHOICES[1][1]
+        or marker["outcome"] != RECOVERY_CHOICES[1][0]
+        or marker["scope"] != DECISION_SCOPE
+    ):
+        raise StateValidationError("Recovery decision evidence is invalid.")
     expected_path = state_dir / marker["backup_name"]
     if (
         marker["backup_path"] != str(expected_path)
@@ -1135,8 +1496,12 @@ def _validate_recovery_initialization(state, state_dir):
     }
     if (
         first["decision_type"] != "state-recovery"
-        or first["question"] != marker["recovery_question"]
-        or first["answer"] != marker["human_answer"]
+        or first["question"] != marker["question"]
+        or first["options"] != marker["options"]
+        or first["recommendation"] != marker["recommendation"]
+        or first["answer"] != marker["answer"]
+        or first["outcome"] != marker["outcome"]
+        or first["scope"] != marker["scope"]
         or first["recovery"] != expected_recovery
     ):
         raise StateValidationError(
@@ -1165,6 +1530,89 @@ def initialize_state(repo_path, pr_number, state, *, runner=run_command):
     return state
 
 
+def _without(mapping, field):
+    return {key: value for key, value in mapping.items() if key != field}
+
+
+def _validate_publication_transition(current, state):
+    current_publication = current["publication"]
+    new_publication = state["publication"]
+    if current_publication is None and new_publication is None:
+        _validate_workspace_runtime(current)
+        return
+    if current["approval"] != state["approval"]:
+        raise StateValidationError(
+            "Publication lifecycle must retain the approved decision."
+        )
+    if current["changes"] != state["changes"]:
+        raise StateValidationError(
+            "Publication lifecycle must retain approved changes."
+        )
+    for field in ("kind", "path", "base_sha"):
+        if current["workspace"][field] != state["workspace"][field]:
+            raise StateValidationError(
+                "Publication lifecycle cannot replace its workspace identity."
+            )
+
+    if current_publication is None:
+        if new_publication["status"] != "committed":
+            raise StateValidationError(
+                "Publication must persist committed before pushed."
+            )
+        if current["pull_request"] != state["pull_request"]:
+            raise StateValidationError(
+                "Committed checkpoint cannot advance the PR head."
+            )
+        if (
+            current["workspace"]["head_sha"]
+            != current["workspace"]["base_sha"]
+            or state["workspace"]["head_sha"]
+            != new_publication["commit_sha"]
+        ):
+            raise StateValidationError(
+                "Committed checkpoint has an invalid workspace transition."
+            )
+        return
+
+    if new_publication is None:
+        raise StateValidationError("Publication lifecycle cannot regress.")
+    old_status = current_publication["status"]
+    new_status = new_publication["status"]
+    allowed = {
+        ("committed", "committed"),
+        ("committed", "pushed"),
+        ("pushed", "pushed"),
+    }
+    if (old_status, new_status) not in allowed:
+        raise StateValidationError("Publication status transition is invalid.")
+    for field in (
+        "commit_sha",
+        "packet_identity",
+        "approval_decision_history_index",
+    ):
+        if current_publication[field] != new_publication[field]:
+            raise StateValidationError(
+                f"Publication transition changed {field}."
+            )
+    if (
+        state["workspace"] != current["workspace"]
+        or _without(state["pull_request"], "head_sha")
+        != _without(current["pull_request"], "head_sha")
+    ):
+        raise StateValidationError(
+            "Publication transition changed immutable target identity."
+        )
+    old_checks = current_publication["checks"]
+    if state["publication"]["checks"][: len(old_checks)] != old_checks:
+        raise StateValidationError(
+            "Publication checks must preserve their existing prefix."
+        )
+    if old_status == new_status and state["pull_request"] != current["pull_request"]:
+        raise StateValidationError(
+            "PR head can advance only on committed-to-pushed transition."
+        )
+
+
 def update_state(
     repo_path,
     pr_number,
@@ -1182,7 +1630,12 @@ def update_state(
         )
     state_dir = state_directory(repo_path, pr_number, runner=runner)
     with pr_lock(state_dir):
-        current = read_state(repo_path, pr_number, runner=runner)
+        current = _read_state_document(
+            repo_path,
+            pr_number,
+            runner=runner,
+            validate_runtime=False,
+        )
         if current is None:
             raise RevisionConflict(f"State does not exist for PR {pr_number}.")
         if current["revision"] != expected_revision:
@@ -1200,6 +1653,7 @@ def update_state(
             raise StateValidationError(
                 "decision_history must preserve its existing prefix."
             )
+        _validate_publication_transition(current, state)
         current_approval = current["approval"]
         if (
             _current_packet_identity(current) != _current_packet_identity(state)
@@ -1253,6 +1707,7 @@ def create_parser():
             command.add_argument("--backup-name", required=True)
             command.add_argument("--recovery-question", required=True)
             command.add_argument("--human-answer", required=True)
+            command.add_argument("--outcome", required=True)
     fingerprint = subparsers.add_parser("fingerprint")
     fingerprint.add_argument("--workspace", required=True, type=Path)
     fingerprint.add_argument(
@@ -1266,6 +1721,11 @@ def create_parser():
     fingerprint.add_argument("--head-sha", required=True)
     fingerprint.add_argument("--commit-message", required=True)
     fingerprint.add_argument("--file", required=True, action="append")
+    fingerprint.add_argument(
+        "--source",
+        choices=("working", "index"),
+        default="working",
+    )
     return parser
 
 
@@ -1295,6 +1755,7 @@ def main(argv=None):
                 backup_name=args.backup_name,
                 recovery_question=args.recovery_question,
                 human_answer=args.human_answer,
+                outcome=args.outcome,
             )
         else:
             result = compute_packet_identity(
@@ -1306,6 +1767,7 @@ def main(argv=None):
                 head_sha=args.head_sha,
                 commit_message=args.commit_message,
                 included_files=args.file,
+                source=args.source,
             )
     except ContextStoreError as error:
         parser.exit(2, f"error: {error}\n")

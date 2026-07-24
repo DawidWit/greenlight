@@ -22,6 +22,35 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(context_store)
 
 EMPTY_DIFF_SHA256 = hashlib.sha256(b"").hexdigest()
+PUBLISH_QUESTION = "Approve this exact commit and push for this PR?"
+APPROVE_LABEL = "Approve the exact displayed commit and push."
+REJECT_LABEL = "Reject it and keep the verified diff local."
+CHANGES_LABEL = "Request changes to the proposed work."
+RECOVERY_QUESTION = "How should the preserved invalid local state be handled?"
+RECOVERY_LEAVE_LABEL = "Leave the preserved state untouched and stop this PR."
+RECOVERY_BACKUP_LABEL = (
+    "Authorize moving the invalid state to a named private backup, then "
+    "initialize fresh state."
+)
+RECOVERY_RECOMMENDATION = (
+    "Leave it untouched until its provenance is understood."
+)
+DECISION_SCOPE = "This PR only."
+
+
+def publish_choices():
+    return [
+        {"outcome": "approved", "label": APPROVE_LABEL},
+        {"outcome": "rejected", "label": REJECT_LABEL},
+        {"outcome": "changes-requested", "label": CHANGES_LABEL},
+    ]
+
+
+def recovery_choices():
+    return [
+        {"outcome": "leave-untouched", "label": RECOVERY_LEAVE_LABEL},
+        {"outcome": "backup-authorized", "label": RECOVERY_BACKUP_LABEL},
+    ]
 
 
 class RecordingRunner:
@@ -56,7 +85,7 @@ def valid_state(
             else "a" * 40
         )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "revision": revision,
         "repository": {
             "name_with_owner": "acme/widgets",
@@ -158,7 +187,12 @@ def state_with_current_changes(**kwargs):
     return state
 
 
-def approve_state(state, revision=0, answer="Yes, publish this exact packet."):
+def approve_state(
+    state,
+    revision=0,
+    answer=APPROVE_LABEL,
+    outcome="approved",
+):
     packet = approval_packet(
         head_repository=state["pull_request"]["head_repository"],
         head_branch=state["pull_request"]["head_branch"],
@@ -174,17 +208,18 @@ def approve_state(state, revision=0, answer="Yes, publish this exact packet."):
             answer=answer,
             transition="approval -> publish",
             packet_identity=packet,
-            question="Approve this exact commit and push for this PR?",
-            outcome="approved",
+            question=PUBLISH_QUESTION,
+            outcome=outcome,
         )
     )
-    state["decision_history"][-1]["options"] = [
-        answer,
-        "Reject this exact packet.",
-        "Request changes to this exact packet.",
-    ]
+    state["decision_history"][-1]["options"] = publish_choices()
+    state["decision_history"][-1]["recommendation"] = (
+        "Approve only if the displayed evidence and target are correct."
+    )
+    state["decision_history"][-1]["scope"] = DECISION_SCOPE
     state["approval"] = {
-        "valid": True,
+        "valid": outcome == "approved",
+        "outcome": outcome,
         "packet_identity": packet,
         "decision_history_index": len(state["decision_history"]) - 1,
         "human_answer": answer,
@@ -398,12 +433,21 @@ class SchemaTests(unittest.TestCase):
                 "identities": [
                     "sk-refactor-parser",
                     "Handle token: none in parser",
+                    "Handle token: actual-secret in parser",
                     "TOKEN=redacted",
+                    "TOKEN='redacted'",
                     "No raw authentication or environment output was stored.",
                 ],
             }
         ]
         self.assertIs(context_store.validate_state(safe, 17), safe)
+
+        unsafe_sentinel_suffix = valid_state()
+        unsafe_sentinel_suffix["changes"]["commit_message"] = (
+            "password: redacted actual-secret"
+        )
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(unsafe_sentinel_suffix, 17)
 
     def test_review_ledger_entries_have_an_exact_safe_shape(self):
         state = valid_state()
@@ -438,14 +482,12 @@ class SchemaTests(unittest.TestCase):
         state = state_with_current_changes()
         packet = approval_packet()
         pending = {
-            "question": "Approve this exact commit and push for this PR?",
-            "options": [
-                "Approve the exact displayed commit and push.",
-                "Reject it and keep the verified diff local.",
-                "Request changes to the proposed work.",
-            ],
-            "recommendation": "Approve only if the packet is correct.",
-            "scope": "This PR only.",
+            "question": PUBLISH_QUESTION,
+            "options": publish_choices(),
+            "recommendation": (
+                "Approve only if the displayed evidence and target are correct."
+            ),
+            "scope": DECISION_SCOPE,
             "packet_identity": packet,
         }
         state["pending_decisions"] = [pending]
@@ -510,8 +552,8 @@ class SchemaTests(unittest.TestCase):
         )
 
         for outcome, answer in (
-            ("rejected", "Reject this exact packet."),
-            ("changes-requested", "Request changes to this exact packet."),
+            ("rejected", REJECT_LABEL),
+            ("changes-requested", CHANGES_LABEL),
         ):
             with self.subTest(outcome=outcome):
                 state = approve_state(state_with_current_changes())
@@ -523,7 +565,71 @@ class SchemaTests(unittest.TestCase):
                     context_store.validate_state(state, 17)
 
                 state["approval"]["valid"] = False
+                state["approval"]["outcome"] = outcome
                 self.assertIs(context_store.validate_state(state, 17), state)
+
+    def test_publish_choices_canonically_bind_selected_label_to_outcome(self):
+        approved = approve_state(state_with_current_changes())
+        self.assertIs(context_store.validate_state(approved, 17), approved)
+
+        for outcome, label in (
+            ("rejected", REJECT_LABEL),
+            ("changes-requested", CHANGES_LABEL),
+        ):
+            with self.subTest(valid_nonapproval=outcome):
+                state = approve_state(
+                    state_with_current_changes(),
+                    answer=label,
+                    outcome=outcome,
+                )
+                self.assertFalse(state["approval"]["valid"])
+                self.assertIs(context_store.validate_state(state, 17), state)
+
+        malformed_states = []
+        mismatch = approve_state(
+            state_with_current_changes(),
+            answer=REJECT_LABEL,
+        )
+        mismatch["approval"]["human_answer"] = REJECT_LABEL
+        malformed_states.append(mismatch)
+
+        changes_mismatch = approve_state(
+            state_with_current_changes(),
+            answer=CHANGES_LABEL,
+        )
+        changes_mismatch["approval"]["human_answer"] = CHANGES_LABEL
+        malformed_states.append(changes_mismatch)
+
+        reordered = approve_state(state_with_current_changes())
+        reordered["decision_history"][0]["options"].reverse()
+        malformed_states.append(reordered)
+
+        duplicate = approve_state(state_with_current_changes())
+        duplicate["decision_history"][0]["options"][2] = duplicate[
+            "decision_history"
+        ][0]["options"][1]
+        malformed_states.append(duplicate)
+
+        unknown = approve_state(state_with_current_changes())
+        unknown["decision_history"][0]["options"][0] = {
+            "outcome": "approved",
+            "label": "Publish whatever is present.",
+        }
+        malformed_states.append(unknown)
+
+        unselected = approve_state(state_with_current_changes())
+        unselected["decision_history"][0]["answer"] = "Sure."
+        unselected["approval"]["human_answer"] = "Sure."
+        malformed_states.append(unselected)
+
+        approval_outcome_mismatch = approve_state(state_with_current_changes())
+        approval_outcome_mismatch["approval"]["outcome"] = "rejected"
+        malformed_states.append(approval_outcome_mismatch)
+
+        for malformed in malformed_states:
+            with self.subTest(malformed=malformed["decision_history"][0]):
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(malformed, 17)
 
     def test_publish_decision_requires_options_and_exact_displayed_answer(self):
         empty_options = approve_state(state_with_current_changes())
@@ -563,13 +669,12 @@ class SchemaTests(unittest.TestCase):
         state = approve_state(state_with_current_changes())
         state["pending_decisions"] = [
             {
-                "question": "Approve this exact commit and push for this PR?",
-                "options": [
-                    "Approve the exact displayed commit and push.",
-                    "Reject it and keep the verified diff local.",
-                ],
-                "recommendation": "Approve only if the packet is correct.",
-                "scope": "This PR only.",
+                "question": PUBLISH_QUESTION,
+                "options": publish_choices(),
+                "recommendation": (
+                    "Approve only if the displayed evidence and target are correct."
+                ),
+                "scope": DECISION_SCOPE,
                 "packet_identity": state["approval"]["packet_identity"],
             }
         ]
@@ -600,7 +705,10 @@ class SchemaTests(unittest.TestCase):
     def test_publication_has_exact_shape_and_approval_linkage(self):
         state = approve_state(state_with_current_changes())
         packet = state["approval"]["packet_identity"]
+        state["workspace"]["head_sha"] = "c" * 40
+        state["pull_request"]["head_sha"] = "c" * 40
         state["publication"] = {
+            "status": "pushed",
             "commit_sha": "c" * 40,
             "pushed_sha": "c" * 40,
             "packet_identity": packet,
@@ -1017,7 +1125,7 @@ class FingerprintTests(unittest.TestCase):
         (repository / "untracked.txt").write_bytes(b"\x00new\xff\n")
         return repository, base_sha
 
-    def compute(self, repository, base_sha, files):
+    def compute(self, repository, base_sha, files, *, source="working"):
         return context_store.compute_packet_identity(
             workspace_path=repository,
             workspace_kind="worktree",
@@ -1027,6 +1135,7 @@ class FingerprintTests(unittest.TestCase):
             head_sha=base_sha,
             commit_message="Apply exact review fixes",
             included_files=files,
+            source=source,
         )
 
     def test_fingerprint_is_stable_and_covers_tracked_deleted_and_untracked(self):
@@ -1180,13 +1289,403 @@ class FingerprintTests(unittest.TestCase):
             with self.assertRaises(context_store.StateValidationError):
                 context_store.read_state(repository, 17)
 
+    def test_working_fingerprint_requires_empty_real_index(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            (repository / "unrelated.txt").write_text(
+                "unrelated\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "unrelated.txt"],
+                check=True,
+            )
+
+            with self.assertRaises(context_store.StateValidationError):
+                self.compute(
+                    repository,
+                    base_sha,
+                    ["tracked.txt", "deleted.txt", "untracked.txt"],
+                )
+
+    def test_working_fingerprint_uses_immutable_temporary_index_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            files = ["tracked.txt", "deleted.txt", "untracked.txt"]
+
+            with patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("must not read mutable files"),
+            ):
+                result = self.compute(repository, base_sha, files)
+
+            staged_names = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(staged_names, "")
+            self.assertRegex(
+                result["packet_identity"]["diff_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+
+    def test_staged_fingerprint_matches_approved_snapshot_and_rejects_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            files = ["tracked.txt", "deleted.txt", "untracked.txt"]
+            approved = self.compute(repository, base_sha, files)
+
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "-A", "--", *files],
+                check=True,
+            )
+            staged = self.compute(
+                repository,
+                base_sha,
+                files,
+                source="index",
+            )
+            self.assertEqual(staged["packet_identity"], approved["packet_identity"])
+
+            (repository / "tracked.txt").write_text(
+                "changed after approval\n",
+                encoding="utf-8",
+            )
+            still_staged = self.compute(
+                repository,
+                base_sha,
+                files,
+                source="index",
+            )
+            self.assertEqual(
+                still_staged["packet_identity"],
+                approved["packet_identity"],
+            )
+
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "tracked.txt"],
+                check=True,
+            )
+            drifted = self.compute(
+                repository,
+                base_sha,
+                files,
+                source="index",
+            )
+            self.assertNotEqual(
+                drifted["packet_identity"]["diff_sha256"],
+                approved["packet_identity"]["diff_sha256"],
+            )
+
+    def test_staged_fingerprint_rejects_extra_staged_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            files = ["tracked.txt", "deleted.txt", "untracked.txt"]
+            (repository / "extra.txt").write_text("extra\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "-A"],
+                check=True,
+            )
+
+            with self.assertRaises(context_store.StateValidationError):
+                self.compute(
+                    repository,
+                    base_sha,
+                    files,
+                    source="index",
+                )
+
+
+class PublicationLifecycleTests(unittest.TestCase):
+    def prepare_approved_commit(self, directory):
+        repository = create_git_repository(directory)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "branch",
+                "-M",
+                "feature/parser",
+            ],
+            check=True,
+        )
+        (repository / "tracked.txt").write_text("before\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-q", "-m", "Base"],
+            check=True,
+        )
+        base_sha = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        remote = Path(directory, "remote.git")
+        subprocess.run(
+            ["git", "init", "--bare", "-q", str(remote)],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "remote", "add", "origin", str(remote)],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "push",
+                "-q",
+                "origin",
+                "HEAD:refs/heads/feature/parser",
+            ],
+            check=True,
+        )
+
+        (repository / "tracked.txt").write_text("after\n", encoding="utf-8")
+        (repository / "new.txt").write_text("new\n", encoding="utf-8")
+        files = ["new.txt", "tracked.txt"]
+        fingerprint = context_store.compute_packet_identity(
+            workspace_path=repository,
+            workspace_kind="worktree",
+            base_sha=base_sha,
+            head_repository="acme/widgets",
+            head_branch="feature/parser",
+            head_sha=base_sha,
+            commit_message="Apply exact review fixes",
+            included_files=files,
+            source="working",
+        )
+        state = valid_state(
+            local_path=str(repository),
+            head_sha=base_sha,
+        )
+        state["workspace"] = fingerprint["workspace"]
+        state["changes"].update(
+            {
+                "files": files,
+                "summary": "Update tracked parser data and add coverage.",
+                "diff_sha256": fingerprint["packet_identity"]["diff_sha256"],
+                "commit_message": "Apply exact review fixes",
+            }
+        )
+        approve_state(state)
+        context_store.initialize_state(repository, 17, state)
+
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "-A", "--", *files],
+            check=True,
+        )
+        staged = context_store.compute_packet_identity(
+            workspace_path=repository,
+            workspace_kind="worktree",
+            base_sha=base_sha,
+            head_repository="acme/widgets",
+            head_branch="feature/parser",
+            head_sha=base_sha,
+            commit_message="Apply exact review fixes",
+            included_files=files,
+            source="index",
+        )
+        self.assertEqual(
+            staged["packet_identity"],
+            state["approval"]["packet_identity"],
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "commit",
+                "-q",
+                "-m",
+                "Apply exact review fixes",
+            ],
+            check=True,
+        )
+        commit_sha = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        commit_tree = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.assertEqual(commit_tree, staged["snapshot_tree"])
+        return repository, remote, base_sha, commit_sha, state
+
+    def committed_state(self, approved, commit_sha):
+        committed = json.loads(json.dumps(approved))
+        committed["revision"] = 1
+        committed["phase"] = "publish"
+        committed["workspace"]["head_sha"] = commit_sha
+        committed["publication"] = {
+            "status": "committed",
+            "commit_sha": commit_sha,
+            "pushed_sha": None,
+            "packet_identity": committed["approval"]["packet_identity"],
+            "approval_decision_history_index": committed["approval"][
+                "decision_history_index"
+            ],
+            "checks": ["staged fingerprint equals approved packet"],
+            "published_at": None,
+        }
+        return committed
+
+    def test_authorized_commit_then_push_preserves_precommit_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                repository,
+                remote,
+                base_sha,
+                commit_sha,
+                approved,
+            ) = self.prepare_approved_commit(directory)
+            committed = self.committed_state(approved, commit_sha)
+
+            direct_pushed = json.loads(json.dumps(committed))
+            direct_pushed["pull_request"]["head_sha"] = commit_sha
+            direct_pushed["publication"].update(
+                {
+                    "status": "pushed",
+                    "pushed_sha": commit_sha,
+                    "published_at": "2026-07-24T13:00:00Z",
+                }
+            )
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(
+                    repository,
+                    17,
+                    0,
+                    direct_pushed,
+                )
+
+            result = context_store.update_state(
+                repository,
+                17,
+                0,
+                committed,
+            )
+            self.assertEqual(result["publication"]["status"], "committed")
+            self.assertEqual(result["pull_request"]["head_sha"], base_sha)
+            self.assertEqual(
+                result["approval"]["packet_identity"]["head_sha"],
+                base_sha,
+            )
+            self.assertEqual(result["workspace"]["head_sha"], commit_sha)
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repository),
+                    "push",
+                    "-q",
+                    "origin",
+                    f"{commit_sha}:refs/heads/feature/parser",
+                ],
+                check=True,
+            )
+            remote_head = subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(remote),
+                    "rev-parse",
+                    "refs/heads/feature/parser",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(remote_head, commit_sha)
+
+            pushed = json.loads(json.dumps(committed))
+            pushed["revision"] = 2
+            pushed["pull_request"]["head_sha"] = commit_sha
+            pushed["publication"].update(
+                {
+                    "status": "pushed",
+                    "pushed_sha": commit_sha,
+                    "published_at": "2026-07-24T13:00:00Z",
+                }
+            )
+            completed = context_store.update_state(
+                repository,
+                17,
+                1,
+                pushed,
+            )
+            self.assertEqual(completed["publication"]["status"], "pushed")
+            self.assertEqual(completed["publication"]["pushed_sha"], commit_sha)
+            self.assertEqual(completed["pull_request"]["head_sha"], commit_sha)
+            self.assertEqual(
+                completed["approval"]["packet_identity"]["head_sha"],
+                base_sha,
+            )
+            self.assertEqual(
+                context_store.read_state(repository, 17),
+                completed,
+            )
+
+    def test_publication_checkpoint_rejects_incoherent_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, _, base_sha, commit_sha, approved = (
+                self.prepare_approved_commit(directory)
+            )
+            committed = self.committed_state(approved, commit_sha)
+
+            malformed_states = []
+            wrong_commit = json.loads(json.dumps(committed))
+            wrong_commit["publication"]["commit_sha"] = "d" * 40
+            malformed_states.append(wrong_commit)
+
+            premature_push = json.loads(json.dumps(committed))
+            premature_push["publication"]["pushed_sha"] = commit_sha
+            malformed_states.append(premature_push)
+
+            moved_pr_head = json.loads(json.dumps(committed))
+            moved_pr_head["pull_request"]["head_sha"] = commit_sha
+            malformed_states.append(moved_pr_head)
+
+            wrong_workspace = json.loads(json.dumps(committed))
+            wrong_workspace["workspace"]["head_sha"] = base_sha
+            malformed_states.append(wrong_workspace)
+
+            for malformed in malformed_states:
+                with self.subTest(publication=malformed["publication"]):
+                    with self.assertRaises(context_store.StateValidationError):
+                        context_store.update_state(
+                            repository,
+                            17,
+                            0,
+                            malformed,
+                        )
+
 
 class RecoveryTests(unittest.TestCase):
-    QUESTION = "How should the preserved invalid local state be handled?"
-    ANSWER = (
-        "Authorize moving the invalid state to a named private backup, then "
-        "initialize fresh state."
-    )
+    QUESTION = RECOVERY_QUESTION
+    ANSWER = RECOVERY_BACKUP_LABEL
 
     def create_corrupt_state(self, repository, content="{broken"):
         state_dir = context_store.state_directory(repository, 17)
@@ -1195,13 +1694,21 @@ class RecoveryTests(unittest.TestCase):
         state_path.write_text(content, encoding="utf-8")
         return state_dir, state_path
 
-    def recover(self, repository, backup_name="state-corrupt.json"):
+    def recover(
+        self,
+        repository,
+        backup_name="state-corrupt.json",
+        *,
+        answer=RECOVERY_BACKUP_LABEL,
+        outcome="backup-authorized",
+    ):
         return context_store.recover_state(
             repository,
             17,
             backup_name=backup_name,
             recovery_question=self.QUESTION,
-            human_answer=self.ANSWER,
+            human_answer=answer,
+            outcome=outcome,
         )
 
     def test_recover_moves_regular_corrupt_state_and_prints_metadata(self):
@@ -1219,8 +1726,12 @@ class RecoveryTests(unittest.TestCase):
                 {
                     "backup_name": "state-corrupt.json",
                     "backup_path": str(backup.resolve()),
-                    "recovery_question": self.QUESTION,
-                    "human_answer": self.ANSWER,
+                    "question": self.QUESTION,
+                    "options": recovery_choices(),
+                    "recommendation": RECOVERY_RECOMMENDATION,
+                    "answer": self.ANSWER,
+                    "outcome": "backup-authorized",
+                    "scope": DECISION_SCOPE,
                 },
             )
             if os.name != "nt":
@@ -1290,6 +1801,42 @@ class RecoveryTests(unittest.TestCase):
 
             self.assertTrue(os.path.lexists(state_path))
 
+    def test_recover_requires_canonical_backup_authorization(self):
+        for answer, outcome in (
+            (RECOVERY_LEAVE_LABEL, "leave-untouched"),
+            (RECOVERY_LEAVE_LABEL, "backup-authorized"),
+            (RECOVERY_BACKUP_LABEL, "leave-untouched"),
+            ("Back it up.", "backup-authorized"),
+        ):
+            with self.subTest(answer=answer, outcome=outcome):
+                with tempfile.TemporaryDirectory() as directory:
+                    repository = create_git_repository(directory)
+                    _, state_path = self.create_corrupt_state(repository)
+                    with self.assertRaises(
+                        context_store.StateValidationError
+                    ):
+                        self.recover(
+                            repository,
+                            answer=answer,
+                            outcome=outcome,
+                        )
+                    self.assertTrue(os.path.lexists(state_path))
+
+    def test_recover_refuses_normally_valid_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository))
+            context_store.initialize_state(repository, 17, initial)
+            state_path = (
+                context_store.state_directory(repository, 17) / "state.json"
+            )
+            before = state_path.read_bytes()
+
+            with self.assertRaises(context_store.StateValidationError):
+                self.recover(repository)
+
+            self.assertEqual(state_path.read_bytes(), before)
+
     def test_fresh_init_after_recovery_requires_exact_first_history_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = create_git_repository(directory)
@@ -1307,12 +1854,18 @@ class RecoveryTests(unittest.TestCase):
                     answer=self.ANSWER,
                     transition="blocked -> evaluate",
                     question=self.QUESTION,
+                    outcome="backup-authorized",
                     recovery={
                         "backup_name": recovery["backup_name"],
                         "backup_path": recovery["backup_path"],
                     },
                 )
             )
+            state["decision_history"][0]["options"] = recovery_choices()
+            state["decision_history"][0][
+                "recommendation"
+            ] = RECOVERY_RECOMMENDATION
+            state["decision_history"][0]["scope"] = DECISION_SCOPE
             result = context_store.initialize_state(repository, 17, state)
             self.assertEqual(
                 result["decision_history"][0]["decision_type"],
@@ -1478,6 +2031,8 @@ class CliTests(unittest.TestCase):
                         RecoveryTests.QUESTION,
                         "--human-answer",
                         RecoveryTests.ANSWER,
+                        "--outcome",
+                        "backup-authorized",
                     ]
                 )
             result = json.loads(stdout.getvalue())

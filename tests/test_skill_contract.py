@@ -211,6 +211,68 @@ class SkillContractTests(unittest.TestCase):
             "`changes-requested` returns to implementation and verification.",
             normalized,
         )
+
+    def test_publish_choices_bind_exact_labels_to_typed_outcomes(self):
+        normalized = " ".join(self.text.split())
+        for phrase in (
+            "`approved` → `Approve the exact displayed commit and push.`",
+            "`rejected` → `Reject it and keep the verified diff local.`",
+            "`changes-requested` → `Request changes to the proposed work.`",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.text)
+        self.assertIn(
+            "Persist each displayed choice as exactly `{outcome, label}` in "
+            "this order; the selected label and stored outcome must come from "
+            "the same canonical choice.",
+            normalized,
+        )
+
+    def test_preapproval_and_staged_fingerprints_use_exact_index_snapshots(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn("--source working", self.text)
+        self.assertIn("--source index", self.text)
+        self.assertIn(
+            "Before the approval fingerprint, require the real Git index to "
+            "be empty.",
+            normalized,
+        )
+        self.assertIn(
+            "The working mode builds an immutable tree through a temporary "
+            "Git index and never stages the real index.",
+            normalized,
+        )
+        self.assertIn(
+            "After approval, stage only the included files, fingerprint the "
+            "real index, and require its complete packet identity to equal "
+            "the approved packet before commit.",
+            normalized,
+        )
+
+    def test_publication_lifecycle_persists_commit_before_push(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Persist a `committed` checkpoint before push, retaining the "
+            "approved pre-commit packet and decision while recording commit "
+            "SHA C and workspace HEAD C.",
+            normalized,
+        )
+        self.assertIn(
+            "Only after the normal push and remote head re-check may the "
+            "checkpoint become `pushed`, with pushed SHA and PR head both C.",
+            normalized,
+        )
+
+    def test_recovery_requires_canonical_backup_authorization(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn("`leave-untouched`", self.text)
+        self.assertIn("`backup-authorized`", self.text)
+        self.assertIn(
+            "Run `recover` only when the exact selected recovery label and "
+            "outcome are the canonical `backup-authorized` choice; the "
+            "`leave-untouched` choice stops the PR without mutation.",
+            normalized,
+        )
         self.assertIn(
             "Never run `git add`, `git commit`, or `git push` for a rejected "
             "or changes-requested outcome.",
