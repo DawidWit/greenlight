@@ -36,6 +36,12 @@ FORBIDDEN_KEY = re.compile(
     r"(authorization|cookie|credential|password|secret|token)",
     re.IGNORECASE,
 )
+FORBIDDEN_NORMALIZED_KEYS = {
+    "environment",
+    "environmentvariables",
+    "authenticationoutput",
+    "authoutput",
+}
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DECISION_FIELDS = {
     "revision",
@@ -132,7 +138,11 @@ def _reject_forbidden_keys(value, path="state"):
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise StateValidationError(f"Non-string key at {path}.")
-            if FORBIDDEN_KEY.search(key):
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+            if (
+                FORBIDDEN_KEY.search(key)
+                or normalized_key in FORBIDDEN_NORMALIZED_KEYS
+            ):
                 raise StateValidationError(f"Forbidden key at {path}.{key}.")
             _reject_forbidden_keys(nested, f"{path}.{key}")
     elif isinstance(value, list):

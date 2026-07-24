@@ -192,6 +192,38 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(context_store.StateValidationError):
             context_store.validate_state(secret, 17)
 
+    def test_rejects_environment_and_authentication_keys_recursively(self):
+        forbidden_keys = (
+            "environment",
+            "environment_variables",
+            "environment-variables",
+            "environment variables",
+            "environmentVariables",
+            "authentication_output",
+            "authentication-output",
+            "authentication output",
+            "authenticationOutput",
+            "auth_output",
+            "auth-output",
+            "auth output",
+            "authOutput",
+        )
+        for key in forbidden_keys:
+            with self.subTest(key=key):
+                state = valid_state()
+                state["verification"]["nested"] = [
+                    {"evidence": ["safe"], key: "forbidden"}
+                ]
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(state, 17)
+
+    def test_allows_legitimate_evidence_fields(self):
+        state = valid_state()
+        state["verification"]["evidence"] = {
+            "environmental_impact": "none"
+        }
+        self.assertIs(context_store.validate_state(state, 17), state)
+
     def test_missing_state_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory, "repo")

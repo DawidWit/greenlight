@@ -287,6 +287,38 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(context_store.StateValidationError):
             context_store.validate_state(secret, 17)
 
+    def test_rejects_environment_and_authentication_keys_recursively(self):
+        forbidden_keys = (
+            "environment",
+            "environment_variables",
+            "environment-variables",
+            "environment variables",
+            "environmentVariables",
+            "authentication_output",
+            "authentication-output",
+            "authentication output",
+            "authenticationOutput",
+            "auth_output",
+            "auth-output",
+            "auth output",
+            "authOutput",
+        )
+        for key in forbidden_keys:
+            with self.subTest(key=key):
+                state = valid_state()
+                state["verification"]["nested"] = [
+                    {"evidence": ["safe"], key: "forbidden"}
+                ]
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(state, 17)
+
+    def test_allows_legitimate_evidence_fields(self):
+        state = valid_state()
+        state["verification"]["evidence"] = {
+            "environmental_impact": "none"
+        }
+        self.assertIs(context_store.validate_state(state, 17), state)
+
     def test_missing_state_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory, "repo")
@@ -355,6 +387,12 @@ FORBIDDEN_KEY = re.compile(
     r"(authorization|cookie|credential|password|secret|token)",
     re.IGNORECASE,
 )
+FORBIDDEN_NORMALIZED_KEYS = {
+    "environment",
+    "environmentvariables",
+    "authenticationoutput",
+    "authoutput",
+}
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DECISION_FIELDS = {
     "revision",
@@ -451,7 +489,11 @@ def _reject_forbidden_keys(value, path="state"):
         for key, nested in value.items():
             if not isinstance(key, str):
                 raise StateValidationError(f"Non-string key at {path}.")
-            if FORBIDDEN_KEY.search(key):
+            normalized_key = re.sub(r"[^a-z0-9]", "", key.lower())
+            if (
+                FORBIDDEN_KEY.search(key)
+                or normalized_key in FORBIDDEN_NORMALIZED_KEYS
+            ):
                 raise StateValidationError(f"Forbidden key at {path}.{key}.")
             _reject_forbidden_keys(nested, f"{path}.{key}")
     elif isinstance(value, list):
