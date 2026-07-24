@@ -2,9 +2,12 @@
 """Persist private per-PR handoff context inside a repository's Git data."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -13,14 +16,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STORE_DIRECTORY = "apply-pr-reviews"
 STATE_FILENAME = "state.json"
+RECOVERY_FILENAME = "recovery.json"
 REQUIRED_TOP_LEVEL = {
     "schema_version",
     "revision",
     "repository",
     "pull_request",
+    "workspace",
     "phase",
     "status",
     "review_ledger",
@@ -100,7 +105,15 @@ DECISION_FIELDS = {
     "scope",
     "transition",
     "packet_identity",
+    "question",
+    "outcome",
+    "recovery",
 }
+WORKSPACE_FIELDS = {"kind", "path", "base_sha", "head_sha"}
+WORKSPACE_KINDS = {"worktree", "clone"}
+PUBLISH_OUTCOMES = {"approved", "rejected", "changes-requested"}
+RECOVERY_FIELDS = {"backup_name", "backup_path"}
+BACKUP_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 APPROVAL_FIELDS = {
     "valid",
     "packet_identity",
@@ -117,13 +130,14 @@ PUBLICATION_FIELDS = {
 }
 PUBLISH_APPROVAL_QUESTION = "Approve this exact commit and push for this PR?"
 RAW_ENV_ASSIGNMENT = re.compile(
-    r"(?m)^[A-Z_][A-Z0-9_]{1,}\s*=\s*\S.*$"
+    r"(?m)^[A-Z_][A-Z0-9_]{1,}\s*=\s*(?P<value>\S.*)$"
 )
+SENSITIVE_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:authorization|api[_ -]?key|client[_ -]?secret|"
+    r"password|secret|token|cookie)\b\s*[:=]\s*(?P<value>\S+)"
+)
+SAFE_SENTINELS = {"none", "redacted", "<redacted>", "unset", "not-set"}
 SENSITIVE_VALUE_PATTERNS = (
-    re.compile(
-        r"(?i)\b(?:authorization|api[_ -]?key|client[_ -]?secret|"
-        r"password|secret|token|cookie)\b\s*[:=]\s*\S+"
-    ),
     re.compile(r"(?i)\bauthorization\s*:\s*(?:bearer|basic)\s+\S+"),
     re.compile(r"\b(?:github_pat_[A-Za-z0-9_]{10,}|gh[pousr]_[A-Za-z0-9]{10,})\b"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -131,7 +145,7 @@ SENSITIVE_VALUE_PATTERNS = (
     re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
     re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     re.compile(
-        r"\b(?:sk-|sk_live_|sk_test_|sk-proj-)[A-Za-z0-9_-]{10,}\b"
+        r"\b(?:sk-|sk_live_|sk_test_|sk-proj-)[A-Za-z0-9_-]{20,}\b"
     ),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/-]{20,}\b"),
     re.compile(
@@ -239,7 +253,19 @@ def _reject_sensitive_content(value, path="state"):
         for index, nested in enumerate(value):
             _reject_sensitive_content(nested, f"{path}[{index}]")
     elif isinstance(value, str):
-        if RAW_ENV_ASSIGNMENT.search(value) or any(
+        environment_values = [
+            match.group("value").strip().lower()
+            for match in RAW_ENV_ASSIGNMENT.finditer(value)
+        ]
+        assignment_values = [
+            match.group("value").strip().lower()
+            for match in SENSITIVE_ASSIGNMENT.finditer(value)
+        ]
+        has_raw_assignment = any(
+            candidate not in SAFE_SENTINELS
+            for candidate in environment_values + assignment_values
+        )
+        if has_raw_assignment or any(
             pattern.search(value) for pattern in SENSITIVE_VALUE_PATTERNS
         ):
             raise StateValidationError(f"Sensitive value at {path}.")
@@ -303,6 +329,58 @@ def _validate_packet_identity(packet, path):
         sorted_values=True,
     )
     return packet
+
+
+def _validate_workspace_identity(workspace, pull_request):
+    _require_exact_object(workspace, WORKSPACE_FIELDS, "workspace")
+    if workspace["kind"] not in WORKSPACE_KINDS:
+        raise StateValidationError("workspace.kind is invalid.")
+    _require_nonempty_string(workspace["path"], "workspace.path")
+    workspace_path = Path(workspace["path"])
+    if not workspace_path.is_absolute():
+        raise StateValidationError("workspace.path must be absolute.")
+    if workspace_path != workspace_path.resolve():
+        raise StateValidationError("workspace.path must be canonical.")
+    for field in ("base_sha", "head_sha"):
+        value = workspace[field]
+        if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
+            raise StateValidationError(f"workspace.{field} is invalid.")
+    if (
+        workspace["base_sha"] != pull_request["head_sha"]
+        or workspace["head_sha"] != pull_request["head_sha"]
+    ):
+        raise StateValidationError(
+            "workspace SHA identity must match pull_request.head_sha."
+        )
+
+
+def _workspace_head(workspace_path):
+    if not workspace_path.is_dir():
+        raise StateValidationError(
+            f"Workspace directory is missing: {workspace_path}"
+        )
+    top_level = Path(
+        run_command(
+            ["git", "-C", str(workspace_path), "rev-parse", "--show-toplevel"]
+        ).strip()
+    ).resolve()
+    if top_level != workspace_path:
+        raise StateValidationError(
+            "Workspace path must identify the Git worktree root."
+        )
+    return run_command(
+        ["git", "-C", str(workspace_path), "rev-parse", "HEAD"]
+    ).strip()
+
+
+def _validate_workspace_runtime(state):
+    workspace = state["workspace"]
+    workspace_path = Path(workspace["path"])
+    actual_head = _workspace_head(workspace_path)
+    if actual_head != workspace["head_sha"]:
+        raise StateValidationError(
+            "Workspace HEAD does not match stored workspace.head_sha."
+        )
 
 
 def _current_packet_identity(state):
@@ -404,12 +482,59 @@ def _validate_decision_history(state):
             _require_nonempty_string(decision[field], f"{path}.{field}")
         for field in ("evidence", "options"):
             _validate_string_list(decision[field], f"{path}.{field}")
+        if not isinstance(decision["question"], str):
+            raise StateValidationError(f"{path}.question must be a string.")
         packet = decision["packet_identity"]
         if packet is not None:
             _validate_packet_identity(packet, f"{path}.packet_identity")
-        if decision["decision_type"] == "publish-approval" and packet is None:
+        outcome = decision["outcome"]
+        recovery = decision["recovery"]
+        if recovery is not None:
+            _require_exact_object(recovery, RECOVERY_FIELDS, f"{path}.recovery")
+            for field in RECOVERY_FIELDS:
+                _require_nonempty_string(
+                    recovery[field], f"{path}.recovery.{field}"
+                )
+        if decision["decision_type"] == "publish-approval":
+            if packet is None:
+                raise StateValidationError(
+                    f"{path}.packet_identity is required for publish approval."
+                )
+            _require_nonempty_string(decision["question"], f"{path}.question")
+            if decision["question"] != PUBLISH_APPROVAL_QUESTION:
+                raise StateValidationError(
+                    f"{path}.question is not the publish approval question."
+                )
+            _validate_string_list(
+                decision["options"],
+                f"{path}.options",
+                minimum=2,
+                maximum=3,
+                unique=True,
+            )
+            if decision["answer"] not in decision["options"]:
+                raise StateValidationError(
+                    f"{path}.answer must equal one displayed option."
+                )
+            if outcome not in PUBLISH_OUTCOMES:
+                raise StateValidationError(f"{path}.outcome is invalid.")
+            if recovery is not None:
+                raise StateValidationError(
+                    f"{path}.recovery must be null for publish approval."
+                )
+        elif outcome is not None:
             raise StateValidationError(
-                f"{path}.packet_identity is required for publish approval."
+                f"{path}.outcome is only valid for publish approval."
+            )
+        if decision["decision_type"] == "state-recovery":
+            _require_nonempty_string(decision["question"], f"{path}.question")
+            if recovery is None:
+                raise StateValidationError(
+                    f"{path}.recovery is required for state recovery."
+                )
+        elif recovery is not None:
+            raise StateValidationError(
+                f"{path}.recovery is only valid for state recovery."
             )
 
 
@@ -452,7 +577,7 @@ def _validate_approval(state):
         approval["human_answer"], "approval.human_answer"
     )
     decision_index = approval["decision_history_index"]
-    _linked_publish_decision(
+    linked_decision = _linked_publish_decision(
         state,
         decision_index,
         packet,
@@ -471,6 +596,10 @@ def _validate_approval(state):
     if approval["valid"] and packet != _current_packet_identity(state):
         raise StateValidationError(
             "Valid approval packet does not match current PR changes."
+        )
+    if approval["valid"] and linked_decision["outcome"] != "approved":
+        raise StateValidationError(
+            "approval.valid requires an approved publish outcome."
         )
     if approval["valid"] and any(
         pending["question"] == PUBLISH_APPROVAL_QUESTION
@@ -497,6 +626,7 @@ def _validate_publication(state):
     approval = state["approval"]
     if (
         not isinstance(approval, dict)
+        or approval["valid"] is not True
         or approval["packet_identity"] != packet
         or approval["decision_history_index"]
         != publication["approval_decision_history_index"]
@@ -504,11 +634,15 @@ def _validate_publication(state):
         raise StateValidationError(
             "Publication does not match the retained approval evidence."
         )
-    _linked_publish_decision(
+    linked_decision = _linked_publish_decision(
         state,
         publication["approval_decision_history_index"],
         packet,
     )
+    if linked_decision["outcome"] != "approved":
+        raise StateValidationError(
+            "Publication requires an approved publish outcome."
+        )
     _validate_string_list(
         publication["checks"],
         "publication.checks",
@@ -517,6 +651,197 @@ def _validate_publication(state):
     _require_nonempty_string(
         publication["published_at"], "publication.published_at"
     )
+
+
+def _run_bytes(command):
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        raise GitContextError(
+            f"Required command is not installed: {command[0]}"
+        ) from error
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise StateValidationError(
+            f"Command failed ({completed.returncode}): {' '.join(command)}"
+            + (f"\n{detail}" if detail else "")
+        )
+    return completed.stdout
+
+
+def _validate_included_path(workspace, included_path):
+    _require_nonempty_string(included_path, "included file")
+    relative = Path(included_path)
+    if (
+        "\0" in included_path
+        or relative.is_absolute()
+        or included_path in {".", ".."}
+        or ".." in relative.parts
+    ):
+        raise StateValidationError(
+            f"Included file must stay inside workspace: {included_path}"
+        )
+    target = workspace.joinpath(*relative.parts)
+    try:
+        target.parent.resolve().relative_to(workspace)
+    except ValueError as error:
+        raise StateValidationError(
+            f"Included file escaped workspace: {included_path}"
+        ) from error
+    return target
+
+
+def _base_file_record(workspace, base_sha, included_path):
+    output = _run_bytes(
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "ls-tree",
+            "-z",
+            base_sha,
+            "--",
+            included_path,
+        ]
+    )
+    if not output:
+        return b"missing", b""
+    entries = [entry for entry in output.split(b"\0") if entry]
+    if len(entries) != 1:
+        raise StateValidationError(
+            f"Included path is not one exact file: {included_path}"
+        )
+    metadata, returned_path = entries[0].split(b"\t", 1)
+    mode, object_type, object_id = metadata.split(b" ", 2)
+    if returned_path.decode("utf-8", "surrogateescape") != included_path:
+        raise StateValidationError(
+            f"Git returned a different included path: {included_path}"
+        )
+    if object_type != b"blob":
+        raise StateValidationError(
+            f"Included base path is not a file: {included_path}"
+        )
+    content = _run_bytes(
+        ["git", "-C", str(workspace), "cat-file", "blob", object_id.decode()]
+    )
+    return mode, content
+
+
+def _working_file_record(target, included_path):
+    try:
+        metadata = os.lstat(target)
+    except FileNotFoundError:
+        return b"missing", b""
+    if stat.S_ISLNK(metadata.st_mode):
+        return b"120000", os.fsencode(os.readlink(target))
+    if not stat.S_ISREG(metadata.st_mode):
+        raise StateValidationError(
+            f"Included workspace path is not a regular file: {included_path}"
+        )
+    mode = b"100755" if metadata.st_mode & stat.S_IXUSR else b"100644"
+    return mode, target.read_bytes()
+
+
+def _framed(label, content):
+    return label + struct.pack(">Q", len(content)) + content
+
+
+def compute_packet_identity(
+    *,
+    workspace_path,
+    workspace_kind,
+    base_sha,
+    head_repository,
+    head_branch,
+    head_sha,
+    commit_message,
+    included_files,
+):
+    workspace = Path(workspace_path).expanduser().resolve()
+    if workspace_kind not in WORKSPACE_KINDS:
+        raise StateValidationError("workspace_kind is invalid.")
+    if not workspace.is_dir():
+        raise StateValidationError(f"Workspace directory is missing: {workspace}")
+    for name, value in (
+        ("base_sha", base_sha),
+        ("head_sha", head_sha),
+    ):
+        if not isinstance(value, str) or not SHA_PATTERN.fullmatch(value):
+            raise StateValidationError(f"{name} is invalid.")
+    if base_sha != head_sha:
+        raise StateValidationError("base_sha must equal the PR head_sha.")
+    for name, value in (
+        ("head_repository", head_repository),
+        ("head_branch", head_branch),
+        ("commit_message", commit_message),
+    ):
+        _require_nonempty_string(value, name)
+    _validate_string_list(
+        included_files,
+        "included_files",
+        minimum=1,
+        unique=True,
+    )
+    actual_head = _workspace_head(workspace)
+    if actual_head != base_sha:
+        raise StateValidationError(
+            "Workspace HEAD does not match the supplied base_sha."
+        )
+
+    canonical = bytearray(b"apply-pr-reviews-change-v1\0")
+    sorted_files = sorted(included_files)
+    for included_path in sorted_files:
+        target = _validate_included_path(workspace, included_path)
+        base_mode, base_content = _base_file_record(
+            workspace, base_sha, included_path
+        )
+        work_mode, work_content = _working_file_record(target, included_path)
+        if base_mode == work_mode and base_content == work_content:
+            raise StateValidationError(
+                f"Included file is unchanged: {included_path}"
+            )
+        if base_mode == b"missing" and work_mode == b"missing":
+            raise StateValidationError(
+                f"Included file is missing: {included_path}"
+            )
+        path_bytes = included_path.encode("utf-8", "surrogateescape")
+        canonical.extend(_framed(b"P", path_bytes))
+        canonical.extend(_framed(b"M", base_mode))
+        canonical.extend(_framed(b"B", base_content))
+        canonical.extend(_framed(b"m", work_mode))
+        canonical.extend(_framed(b"W", work_content))
+
+    final_head = run_command(
+        ["git", "-C", str(workspace), "rev-parse", "HEAD"]
+    ).strip()
+    if final_head != actual_head:
+        raise StateValidationError(
+            "Workspace HEAD changed while computing the fingerprint."
+        )
+
+    packet = {
+        "head_repository": head_repository,
+        "head_branch": head_branch,
+        "head_sha": head_sha,
+        "diff_sha256": hashlib.sha256(canonical).hexdigest(),
+        "included_files": sorted_files,
+        "commit_message": commit_message,
+    }
+    workspace_identity = {
+        "kind": workspace_kind,
+        "path": str(workspace),
+        "base_sha": base_sha,
+        "head_sha": actual_head,
+    }
+    return {
+        "workspace": workspace_identity,
+        "packet_identity": packet,
+    }
 
 
 def validate_state(state, expected_pr=None):
@@ -566,6 +891,7 @@ def validate_state(state, expected_pr=None):
     for key in ("url", "base_branch", "head_repository", "head_branch"):
         if not isinstance(pull_request[key], str) or not pull_request[key]:
             raise StateValidationError(f"pull_request.{key} is invalid.")
+    _validate_workspace_identity(state["workspace"], pull_request)
     if not isinstance(state["decision_history"], list):
         raise StateValidationError("decision_history must be a list.")
     if not isinstance(state["verification"], dict):
@@ -586,8 +912,12 @@ def validate_state(state, expected_pr=None):
 def read_state(repo_path, pr_number, *, runner=run_command):
     directory = state_directory(repo_path, pr_number, runner=runner)
     path = directory / STATE_FILENAME
-    if not path.exists():
+    if not os.path.lexists(path):
         return None
+    if path.is_symlink():
+        raise StateValidationError(
+            f"Cannot read state through a symbolic link: {path}"
+        )
     path = path.resolve()
     if path.parent != directory:
         raise StateValidationError("State file escaped the PR state directory.")
@@ -595,7 +925,10 @@ def read_state(repo_path, pr_number, *, runner=run_command):
         state = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise StateValidationError(f"Cannot read valid state: {path}") from error
-    return validate_state(state, pr_number)
+    validate_state(state, pr_number)
+    _validate_repository_path(state, repo_path)
+    _validate_workspace_runtime(state)
+    return state
 
 
 def _utc_now():
@@ -705,19 +1038,130 @@ def _atomic_write(path, state):
             os.unlink(temporary_name)
 
 
+def _validate_backup_name(backup_name):
+    if (
+        not isinstance(backup_name, str)
+        or not BACKUP_NAME_PATTERN.fullmatch(backup_name)
+        or backup_name in {STATE_FILENAME, RECOVERY_FILENAME, ".lock"}
+    ):
+        raise StateValidationError("backup_name is unsafe.")
+
+
+def recover_state(
+    repo_path,
+    pr_number,
+    *,
+    backup_name,
+    recovery_question,
+    human_answer,
+    runner=run_command,
+):
+    _validate_backup_name(backup_name)
+    _require_nonempty_string(recovery_question, "recovery_question")
+    _require_nonempty_string(human_answer, "human_answer")
+    state_dir = state_directory(repo_path, pr_number, runner=runner)
+    with pr_lock(state_dir):
+        state_path = state_dir / STATE_FILENAME
+        backup_path = state_dir / backup_name
+        marker_path = state_dir / RECOVERY_FILENAME
+        if not os.path.lexists(state_path):
+            raise StateValidationError("No lexical state.json entry to recover.")
+        if os.path.lexists(backup_path):
+            raise StateValidationError("Recovery backup already exists.")
+        if os.path.lexists(marker_path):
+            raise StateValidationError("Recovery metadata already exists.")
+        result = {
+            "backup_name": backup_name,
+            "backup_path": str(backup_path),
+            "recovery_question": recovery_question,
+            "human_answer": human_answer,
+        }
+        os.replace(state_path, backup_path)
+        try:
+            backup_mode = os.lstat(backup_path).st_mode
+            if stat.S_ISDIR(backup_mode):
+                _set_private_mode(backup_path, 0o700)
+            elif not stat.S_ISLNK(backup_mode):
+                _set_private_mode(backup_path, 0o600)
+            _atomic_write(marker_path, result)
+        except BaseException:
+            if not os.path.lexists(state_path) and os.path.lexists(backup_path):
+                os.replace(backup_path, state_path)
+            raise
+    return result
+
+
+def _read_recovery_marker(state_dir):
+    marker_path = state_dir / RECOVERY_FILENAME
+    if not os.path.lexists(marker_path):
+        return None
+    if marker_path.is_symlink():
+        raise StateValidationError("Recovery metadata cannot be a symlink.")
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise StateValidationError("Recovery metadata is unreadable.") from error
+    required = {
+        "backup_name",
+        "backup_path",
+        "recovery_question",
+        "human_answer",
+    }
+    _require_exact_object(marker, required, "recovery metadata")
+    _validate_backup_name(marker["backup_name"])
+    for field in required:
+        _require_nonempty_string(marker[field], f"recovery metadata.{field}")
+    expected_path = state_dir / marker["backup_name"]
+    if (
+        marker["backup_path"] != str(expected_path)
+        or not os.path.lexists(expected_path)
+    ):
+        raise StateValidationError("Recovery backup identity is invalid.")
+    return marker
+
+
+def _validate_recovery_initialization(state, state_dir):
+    marker = _read_recovery_marker(state_dir)
+    if marker is None:
+        return None
+    if not state["decision_history"]:
+        raise StateValidationError(
+            "Fresh state after recovery requires first decision-history entry."
+        )
+    first = state["decision_history"][0]
+    expected_recovery = {
+        "backup_name": marker["backup_name"],
+        "backup_path": marker["backup_path"],
+    }
+    if (
+        first["decision_type"] != "state-recovery"
+        or first["question"] != marker["recovery_question"]
+        or first["answer"] != marker["human_answer"]
+        or first["recovery"] != expected_recovery
+    ):
+        raise StateValidationError(
+            "First decision-history entry does not match authorized recovery."
+        )
+    return state_dir / RECOVERY_FILENAME
+
+
 def initialize_state(repo_path, pr_number, state, *, runner=run_command):
     validate_state(state, pr_number)
     _validate_repository_path(state, repo_path)
+    _validate_workspace_runtime(state)
     if state["revision"] != 0:
         raise StateValidationError("Initial state revision must be 0.")
     state_dir = state_directory(repo_path, pr_number, runner=runner)
     with pr_lock(state_dir):
         path = state_dir / STATE_FILENAME
-        if path.exists():
+        if os.path.lexists(path):
             raise RevisionConflict(
                 f"State already exists for PR {pr_number}: {path}"
             )
+        recovery_marker = _validate_recovery_initialization(state, state_dir)
         _atomic_write(path, state)
+        if recovery_marker is not None:
+            recovery_marker.unlink()
     return state
 
 
@@ -731,6 +1175,7 @@ def update_state(
 ):
     validate_state(state, pr_number)
     _validate_repository_path(state, repo_path)
+    _validate_workspace_runtime(state)
     if state["revision"] != expected_revision + 1:
         raise RevisionConflict(
             "New state revision must equal expected revision plus one."
@@ -796,7 +1241,7 @@ def create_parser():
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("read", "init", "update"):
+    for name in ("read", "init", "update", "recover"):
         command = subparsers.add_parser(name)
         command.add_argument("--repo", required=True, type=Path)
         command.add_argument("--pr", required=True, type=int)
@@ -804,6 +1249,23 @@ def create_parser():
             command.add_argument(
                 "--expected-revision", required=True, type=int
             )
+        elif name == "recover":
+            command.add_argument("--backup-name", required=True)
+            command.add_argument("--recovery-question", required=True)
+            command.add_argument("--human-answer", required=True)
+    fingerprint = subparsers.add_parser("fingerprint")
+    fingerprint.add_argument("--workspace", required=True, type=Path)
+    fingerprint.add_argument(
+        "--workspace-kind",
+        required=True,
+        choices=sorted(WORKSPACE_KINDS),
+    )
+    fingerprint.add_argument("--base-sha", required=True)
+    fingerprint.add_argument("--head-repository", required=True)
+    fingerprint.add_argument("--head-branch", required=True)
+    fingerprint.add_argument("--head-sha", required=True)
+    fingerprint.add_argument("--commit-message", required=True)
+    fingerprint.add_argument("--file", required=True, action="append")
     return parser
 
 
@@ -819,12 +1281,31 @@ def main(argv=None):
                 args.pr,
                 _read_input(),
             )
-        else:
+        elif args.command == "update":
             result = update_state(
                 args.repo,
                 args.pr,
                 args.expected_revision,
                 _read_input(),
+            )
+        elif args.command == "recover":
+            result = recover_state(
+                args.repo,
+                args.pr,
+                backup_name=args.backup_name,
+                recovery_question=args.recovery_question,
+                human_answer=args.human_answer,
+            )
+        else:
+            result = compute_packet_identity(
+                workspace_path=args.workspace,
+                workspace_kind=args.workspace_kind,
+                base_sha=args.base_sha,
+                head_repository=args.head_repository,
+                head_branch=args.head_branch,
+                head_sha=args.head_sha,
+                commit_message=args.commit_message,
+                included_files=args.file,
             )
     except ContextStoreError as error:
         parser.exit(2, f"error: {error}\n")

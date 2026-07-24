@@ -2073,3 +2073,59 @@ history behavior.
 Run the full suite, Python compilation, both CLI help commands, the skill
 validator, `git diff --check`, and a clean-status inspection. Self-review the
 complete branch interaction before the final commit.
+
+## Final Review Hardening Addendum
+
+This addendum supersedes older schema and diff-generation details in this
+historical plan.
+
+### RED
+
+Add regression tests that fail under the prior implementation for:
+
+- typed `approved`, `rejected`, and `changes-requested` publish outcomes,
+  two-or-three unique displayed options, and an answer equal to one option;
+- configured `repository.local_path` validation and fail-closed reads or
+  initialization when `state.json` is a dangling symlink;
+- safe secret-like prose and redaction sentinels without weakening rejection of
+  real assignments, credential formats, or raw authentication output;
+- deterministic fingerprinting of tracked edits, deletions, untracked files,
+  executable modes, and symlinks from an exact isolated workspace;
+- rejection of missing, outside, unchanged, and base-mismatched fingerprint
+  inputs, plus takeover from a missing or mismatched workspace;
+- locked recovery of corrupt regular state and dangling symlink entries to a
+  safe contained non-overwriting private backup;
+- fresh initialization whose first history event contains the exact authorized
+  recovery question, answer, and returned backup identity.
+
+Run these focused tests first and retain the expected failures as RED evidence.
+
+### GREEN
+
+Move the state contract to schema version 2. Add exact top-level `workspace`
+identity `{kind, path, base_sha, head_sha}` and exact decision fields
+`question`, `outcome`, and `recovery`. Only an `approved` outcome can support
+`approval.valid: true` or publication.
+
+Add `context_store.py fingerprint`. Its canonical byte stream is the
+`apply-pr-reviews-change-v1\0` header followed, for every sorted included path,
+by tagged path, base-mode, base-content, working-mode, and working-content
+records. Each record uses a one-byte tag plus an 8-byte unsigned big-endian
+payload length and payload bytes. Hash the complete stream with SHA-256.
+
+Add `context_store.py recover`. Under the existing PR lock, lexically move
+`state.json` without following it, require a safe contained unused backup name,
+write private structured recovery metadata, and require its exact values in the
+first history event accepted by the next fresh `init`.
+
+Update `SKILL.md` and the design specification so takeover recomputes the
+fingerprint, publication branches on typed outcome before Git mutation, and
+invalid-state recovery uses only the sanctioned command.
+
+### Verification
+
+Run focused schema, fingerprint, recovery, CLI, and skill-contract tests. Then
+run fresh-context pressure evaluations for negative publish answers, stale or
+self-asserted fingerprints, and requests to move corrupt state directly.
+Finally run the full unit suite, compilation, top-level and new-command CLI help,
+the skill validator, `git diff --check`, and a branch self-review before commit.

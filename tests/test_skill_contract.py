@@ -202,6 +202,59 @@ class SkillContractTests(unittest.TestCase):
             normalized,
         )
 
+    def test_publish_answer_branches_before_git_mutation(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn(
+            "Interpret the exact displayed-option answer through the stored "
+            "`outcome`: `approved` may continue to the final re-check; "
+            "`rejected` keeps the verified work local and stops publication; "
+            "`changes-requested` returns to implementation and verification.",
+            normalized,
+        )
+        self.assertIn(
+            "Never run `git add`, `git commit`, or `git push` for a rejected "
+            "or changes-requested outcome.",
+            normalized,
+        )
+
+    def test_requires_recomputed_fingerprint_and_workspace_takeover(self):
+        normalized = " ".join(self.text.split())
+        for phrase in (
+            "context_store.py fingerprint",
+            "workspace",
+            "base_sha",
+            "head_sha",
+            "apply-pr-reviews-change-v1",
+            "8-byte unsigned big-endian",
+            "tracked changes",
+            "deletions",
+            "untracked",
+            "file mode",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.text)
+        self.assertIn(
+            "Recompute the fingerprint from the recorded isolated workspace "
+            "before trusting takeover evidence, showing approval, and "
+            "publishing; any missing or mismatched workspace fails closed.",
+            normalized,
+        )
+
+    def test_recovery_uses_sanctioned_command_and_fresh_history(self):
+        normalized = " ".join(self.text.split())
+        self.assertIn("context_store.py recover", self.text)
+        self.assertIn(
+            "After authorization, use `recover`; never move, rename, delete, "
+            "or edit state directly.",
+            normalized,
+        )
+        self.assertIn(
+            "Fresh `init` must make the exact authorized recovery question, "
+            "human answer, and returned backup identity the first "
+            "decision-history entry.",
+            normalized,
+        )
+
     def test_requires_summaries_and_prohibits_sensitive_raw_values(self):
         normalized = " ".join(self.text.split())
         self.assertIn(

@@ -26,10 +26,9 @@ NO COMMIT OR PUSH WITHOUT AN APPROVED, CURRENT PACKET
 ```
 
 A `packet_identity` has exactly `head_repository`, `head_branch`, `head_sha`,
-`diff_sha256`, `included_files`, and `commit_message`. `diff_sha256` is the
-lowercase SHA-256 of deterministic canonical patch bytes for the sorted
-included files, including untracked-file patches, not a prose diff summary.
-A packet is current only while every field remains unchanged.
+`diff_sha256`, `included_files`, and `commit_message`. Build it only with
+`context_store.py fingerprint` in the recorded isolated workspace. A packet is
+current only while every field and that workspace identity remain unchanged.
 
 Current approval is required before `git add`, `git commit`, or `git push`.
 
@@ -82,7 +81,10 @@ input; never use an intermediate context file outside the Git common directory.
 3. Record the head repository and branch.
 4. Verify permission to update a fork head.
 5. Run documented checks before editing and record pre-existing failures.
-6. Persist the baseline checkpoint.
+6. Record `workspace` with exactly `kind`, absolute `path`, `base_sha`, and
+   `head_sha`. Both SHAs must equal the PR head used to create the isolated
+   workspace.
+7. Persist the baseline checkpoint.
 
 ### Phase 4: Implement and Verify
 
@@ -99,6 +101,36 @@ environment output, raw authentication output, authorization headers, cookies,
 credentials, or credential material in any key or value.
 
 ### Phase 5: Request Approval
+
+Compute the proposed packet with:
+
+```text
+python3 <skill-directory>/scripts/context_store.py fingerprint \
+  --workspace <isolated-path> --workspace-kind <worktree-or-clone> \
+  --base-sha <recorded-pr-head-sha> \
+  --head-repository <owner/repository> --head-branch <branch> \
+  --head-sha <recorded-pr-head-sha> --commit-message <exact-message> \
+  --file <included-file> [--file <included-file> ...]
+```
+
+The command returns the exact `workspace` and `packet_identity` to persist.
+It rejects a missing or moved workspace, an incorrect base, unchanged or
+missing files, paths outside the workspace, and unsupported file types.
+
+The canonical fingerprint begins with `apply-pr-reviews-change-v1` followed by
+a NUL byte. For each lexically sorted included path, append five records in
+order: path (`P`), base file mode (`M`), base content (`B`), working file mode
+(`m`), and working content (`W`). Each record is its one-byte tag, an
+8-byte unsigned big-endian payload length, and the exact payload bytes. Use
+`missing` as the mode and empty content when one side is absent. It covers
+tracked changes, deletions, untracked files, and file mode changes, including
+executable bits and symlink target bytes. `diff_sha256` is the lowercase
+SHA-256 of those complete canonical bytes, not a prose summary or raw command
+output.
+
+Recompute the fingerprint from the recorded isolated workspace before trusting
+takeover evidence, showing approval, and publishing; any missing or mismatched
+workspace fails closed.
 
 Always persist the pending approval decision first and render the complete gate;
 never merely summarize either step, even when asked to commit or push first.
@@ -125,7 +157,10 @@ displaying the gate.
 A valid approval must match the current `pull_request` target and the current
 `changes` exactly, and must link to an append-only `publish-approval`
 decision-history entry with the same complete `packet_identity` and the
-non-empty exact `human_answer`. Store that linkage as
+non-empty exact `human_answer`. The entry must store the exact question, two or
+three non-empty unique displayed options, the answer equal to exactly one
+option, and typed `outcome`: `approved`, `rejected`, or `changes-requested`.
+Store that linkage as
 `decision_history_index`. Approval objects have exactly `valid`,
 `packet_identity`, `decision_history_index`, and `human_answer`.
 
@@ -152,7 +187,12 @@ the **exact push target:** repository and branch.
 ### Phase 6: Commit and Push
 
 Record the exact human answer and complete packet in a `publish-approval`
-decision-history entry before resuming. Fetch the remote head again.
+decision-history entry before resuming. Interpret the exact displayed-option
+answer through the stored `outcome`: `approved` may continue to the final
+re-check; `rejected` keeps the verified work local and stops publication;
+`changes-requested` returns to implementation and verification. Never run
+`git add`, `git commit`, or `git push` for a rejected or changes-requested
+outcome. Fetch the remote head again only for an approved outcome.
 
 A change to the head repository, head branch, head SHA, `diff_sha256`,
 `included_files`, or `commit_message` invalidates approval. Persist an
@@ -213,9 +253,13 @@ At takeover:
 
 1. Load existing local context and decision history.
 2. Compare its head SHA with the current remote head.
-3. Reuse evidence that still matches current code.
-4. Revalidate stale evidence and mark superseded conclusions.
-5. Preserve human decisions only while their assumptions hold.
+3. Verify the configured `repository.local_path` and recorded `workspace`
+   identity; a missing directory, mismatched Git HEAD, or state symlink fails
+   closed.
+4. Recompute the recorded file fingerprint before reusing evidence.
+5. Reuse evidence that still matches current code.
+6. Revalidate stale evidence and mark superseded conclusions.
+7. Preserve human decisions only while their assumptions hold.
 
 If local state or decision history is unreadable, corrupt, or
 identity-mismatched, stop that PR and show the exact scoped
@@ -244,18 +288,36 @@ Options:
 Paused scope: This PR only.
 ```
 
+After authorization, use `recover`; never move, rename, delete, or edit state
+directly.
+
+```text
+python3 <skill-directory>/scripts/context_store.py recover \
+  --repo <local-path> --pr <number> --backup-name <safe-name> \
+  --recovery-question <exact-displayed-question> \
+  --human-answer <exact-human-answer>
+```
+
+The locked command moves the lexical `state.json` entry without following a
+symlink, refuses an existing or escaping backup name, applies private modes
+where possible, and returns the exact backup identity. Fresh `init` must make
+the exact authorized recovery question, human answer, and returned backup
+identity the first decision-history entry.
+
 Use `scripts/context_store.py`; never edit `state.json` directly. Every update
 must supply the expected revision. On a revision conflict or lock, stop the
 affected PR, reload, reconcile, and retry. Never break a lock automatically.
 
 Every complete state document has these top-level fields:
-`schema_version`, `revision`, `repository`, `pull_request`, `phase`, `status`,
-`review_ledger`, `changes`, `verification`, `pending_decisions`,
-`decision_history`, `approval`, `publication`, and `updated_at`.
+`schema_version` (currently `2`), `revision`, `repository`, `pull_request`,
+`workspace`, `phase`, `status`, `review_ledger`, `changes`, `verification`,
+`pending_decisions`, `decision_history`, `approval`, `publication`, and
+`updated_at`.
 
 `repository` contains `name_with_owner` and the configured `local_path`.
 `pull_request` contains `number`, `url`, `base_branch`, `head_repository`,
-`head_branch`, and `head_sha`. Each review-ledger entry has exactly `url`,
+`head_branch`, and `head_sha`. `workspace` contains exactly `kind`, absolute
+`path`, `base_sha`, and `head_sha`. Each review-ledger entry has exactly `url`,
 `author`, `requested_behavior`, `evidence`, and `disposition`. `changes` has
 exactly `files`, `summary`, `diff_sha256`, and `commit_message`. `disposition`
 is exactly one of `current-and-actionable`, `resolved`, `outdated`, `duplicate`,
@@ -264,8 +326,9 @@ is exactly one of `current-and-actionable`, `resolved`, `outdated`, `duplicate`,
 decision has exactly `question`, `options`, `recommendation`, `scope`, and
 `packet_identity`; use `null` packet identity only for non-publish decisions.
 Each decision-history entry contains `revision`, `timestamp`, `decision_type`,
-`evidence`, `options`, `recommendation`, `answer`, `scope`, `transition`, and
-`packet_identity`. A publish decision requires the exact packet and answer.
+`evidence`, `options`, `recommendation`, `answer`, `scope`, `transition`,
+`packet_identity`, `question`, `outcome`, and `recovery`. A publish decision
+requires the exact packet, question, options, answer, and typed outcome.
 Publication has exactly `commit_sha`, `pushed_sha`, `packet_identity`,
 `approval_decision_history_index`, `checks`, and `published_at`, and links to
 the same publish decision. Keep decision history append-only.

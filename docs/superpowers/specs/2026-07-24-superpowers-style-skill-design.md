@@ -120,7 +120,9 @@ configured checkout, including unrelated changes and untracked files.
 
 Record the head repository and branch. Verify update permission for fork PRs.
 Run documented checks before editing and separate pre-existing failures from
-new regressions.
+new regressions. Persist the isolated workspace identity as exactly `kind`,
+absolute `path`, `base_sha`, and `head_sha`; both SHAs equal the PR head at
+which the workspace was created.
 
 ### Phase 4: Implement and Verify
 
@@ -132,7 +134,19 @@ before requesting approval. Exclude unsafe or unverifiable changes.
 
 ### Phase 5: Request Approval
 
-Re-check the PR head SHA. Present the existing approval packet with:
+Re-check the PR head SHA. Run `context_store.py fingerprint` against the
+recorded isolated workspace and the exact included files. The command requires
+the workspace HEAD, `base_sha`, and packet `head_sha` to agree. It
+deterministically covers tracked changes, deletions, untracked files, file
+contents, and file modes, and rejects unchanged, missing, escaping, or
+unsupported paths.
+
+The canonical byte stream begins `apply-pr-reviews-change-v1\0`. For each
+sorted path, append path, base mode, base content, working mode, and working
+content records. Every record is a one-byte tag, an 8-byte unsigned big-endian
+payload length, and payload bytes. SHA-256 of this stream is `diff_sha256`.
+
+Present the resulting approval packet with:
 
 - PR URL;
 - review feedback dispositions;
@@ -151,12 +165,19 @@ A valid approval is not a free-standing boolean. It has exactly `valid`,
 `packet_identity`, `decision_history_index`, and `human_answer`; it must link to
 an append-only `publish-approval` history entry containing the same complete
 packet and non-empty exact human answer. Initialization and takeover reject
-approval that lacks any part of that evidence.
+approval that lacks any part of that evidence. A publish decision also stores
+the exact question, two or three non-empty unique displayed options, an answer
+equal to exactly one option, and an `approved`, `rejected`, or
+`changes-requested` outcome.
 
 ### Phase 6: Commit and Push
 
-After approval, fetch and compare the remote target and all change-identity
-fields. A changed head repository, head branch, head SHA, diff SHA-256,
+Branch on the stored outcome before any Git mutation. Only `approved` may
+continue. `rejected` keeps the verified work local and stops publication;
+`changes-requested` returns to implementation and verification. Then recompute
+the fingerprint from the recorded workspace, fetch and compare the remote
+target, and compare all change-identity fields. A changed head repository,
+head branch, head SHA, diff SHA-256,
 included-file list, or commit message requires a current-revision
 `approval-invalidated` event for the old packet. Preserve invalid approval
 history for audit, but never use it as publication authority. Reconcile,
@@ -230,6 +251,7 @@ Use `state.json` as the single authoritative handoff document. Include:
 - schema version and monotonic revision;
 - repository identity, local repository path, PR number, and PR URL;
 - base branch, head repository, head branch, and recorded head SHA;
+- isolated workspace kind, absolute path, base SHA, and current HEAD SHA;
 - current phase and status;
 - review-ledger dispositions with evidence;
 - changed files, deterministic diff SHA-256, diff summary, and commit message;
@@ -245,7 +267,8 @@ Use exact nested shapes. Review entries contain `url`, `author`,
 `files`, `summary`, `diff_sha256`, and `commit_message`. Pending decisions
 contain all five fields `question`, `options`, `recommendation`, `scope`, and
 `packet_identity`; only non-publish decisions may use a null packet. Decision
-history adds `packet_identity` to the existing decision evidence. Publication
+history has exact `question`, `outcome`, and `recovery` fields in addition to
+the existing evidence and `packet_identity`. Publication
 contains `commit_sha`, `pushed_sha`, `packet_identity`,
 `approval_decision_history_index`, `checks`, and `published_at`, and must link
 to retained approval and its exact publish decision.
@@ -267,7 +290,8 @@ For every decision-history entry, record:
 Add a deterministic `scripts/context_store.py` tool. Require agents to use the
 tool rather than editing ledger files directly. The tool must:
 
-- validate the schema and repository/PR identity;
+- validate schema version 2, configured repository path, PR identity, and
+  isolated workspace identity;
 - acquire a PR-scoped lock with atomic directory creation;
 - re-check the expected revision after acquiring the lock;
 - append decision history and write `state.json` through one atomic replace;
@@ -279,7 +303,14 @@ tool rather than editing ledger files directly. The tool must:
 - never store secret-shaped keys or sensitive values, including raw
   environment/authentication output, authorization headers, cookies,
   credential assignments, private keys, or common credential formats;
-- allow safe summaries such as authentication success and check results.
+- allow safe summaries such as authentication success and check results;
+- compute canonical change fingerprints only from a matching isolated
+  workspace;
+- recover authorized invalid state with a locked lexical move to a contained,
+  non-overwriting private backup, including when `state.json` is a dangling
+  symlink;
+- require the exact recovery question, human answer, and returned backup
+  identity as the first history entry of fresh state.
 
 Always release the lock in a `finally` path. Never break an existing or stale
 lock automatically; report it as a scoped blocker with lock metadata so the
@@ -291,10 +322,12 @@ At the beginning of each PR:
 
 1. Read the local snapshot and decision history.
 2. Compare the recorded head SHA with the current remote head.
-3. Reuse verified evidence that still matches current code.
-4. Revalidate stale evidence and mark superseded conclusions explicitly.
-5. Preserve current human decisions when their assumptions still hold.
-6. Surface a new human decision when changed evidence invalidates a prior
+3. Verify `repository.local_path` and the recorded workspace path and Git HEAD.
+4. Recompute the fingerprint for the recorded included files.
+5. Reuse verified evidence that still matches current code.
+6. Revalidate stale evidence and mark superseded conclusions explicitly.
+7. Preserve current human decisions when their assumptions still hold.
+8. Surface a new human decision when changed evidence invalidates a prior
    choice.
 
 The ledger is a handoff and evidence store, not authority to bypass
@@ -353,8 +386,9 @@ the identity of the work.
   overwrite, delete, repair, rename, or replace it automatically.
 - Because invalid state cannot safely persist its own pending record, treat
   this as the sole persistence-order exception: show the recovery gate first,
-  then, only after authorization and backup, record the exact question and
-  answer as the first decision in fresh state.
+  then, only after authorization, call `context_store.py recover`. Fresh
+  initialization must record the exact question, answer, and returned backup
+  identity as the first decision. Never move or edit invalid state directly.
 
 ## Rationalization Defense
 

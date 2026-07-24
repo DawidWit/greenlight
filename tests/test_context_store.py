@@ -2,6 +2,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -36,11 +37,26 @@ class RecordingRunner:
 def valid_state(
     pr_number=17,
     revision=0,
-    head_sha="a" * 40,
+    head_sha=None,
     local_path="/tmp/widgets",
+    workspace_path=None,
 ):
+    if workspace_path is None:
+        workspace_path = local_path
+    if head_sha is None:
+        completed = subprocess.run(
+            ["git", "-C", str(workspace_path), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        head_sha = (
+            completed.stdout.strip()
+            if completed.returncode == 0
+            else "a" * 40
+        )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "revision": revision,
         "repository": {
             "name_with_owner": "acme/widgets",
@@ -52,6 +68,12 @@ def valid_state(
             "base_branch": "main",
             "head_repository": "acme/widgets",
             "head_branch": "feature/parser",
+            "head_sha": head_sha,
+        },
+        "workspace": {
+            "kind": "worktree",
+            "path": str(Path(workspace_path).resolve()),
+            "base_sha": head_sha,
             "head_sha": head_sha,
         },
         "phase": "evaluate",
@@ -78,6 +100,9 @@ def decision_event(
     answer="Apply",
     transition="evaluate -> baseline",
     packet_identity=None,
+    question="",
+    outcome=None,
+    recovery=None,
 ):
     return {
         "revision": revision,
@@ -90,6 +115,9 @@ def decision_event(
         "scope": "PR #17",
         "transition": transition,
         "packet_identity": packet_identity,
+        "question": question,
+        "outcome": outcome,
+        "recovery": recovery,
     }
 
 
@@ -146,8 +174,15 @@ def approve_state(state, revision=0, answer="Yes, publish this exact packet."):
             answer=answer,
             transition="approval -> publish",
             packet_identity=packet,
+            question="Approve this exact commit and push for this PR?",
+            outcome="approved",
         )
     )
+    state["decision_history"][-1]["options"] = [
+        answer,
+        "Reject this exact packet.",
+        "Request changes to this exact packet.",
+    ]
     state["approval"] = {
         "valid": True,
         "packet_identity": packet,
@@ -332,6 +367,7 @@ class SchemaTests(unittest.TestCase):
     def test_rejects_sensitive_string_values_but_allows_safe_summaries(self):
         sensitive_values = (
             "PATH=/usr/local/bin\nHOME=/Users/example\nSHELL=/bin/zsh",
+            "TOKEN=actual-secret-material-1234567890",
             "Authorization: Bearer abcdefghijklmnopqrstuvwxyz",
             "github_pat_11AA0_examplecredentialmaterial",
             "AKIAIOSFODNN7EXAMPLE",
@@ -358,7 +394,13 @@ class SchemaTests(unittest.TestCase):
                 "summary": (
                     "Authentication check passed. Environment-dependent tests "
                     "passed. Credential scan reported no findings."
-                )
+                ),
+                "identities": [
+                    "sk-refactor-parser",
+                    "Handle token: none in parser",
+                    "TOKEN=redacted",
+                    "No raw authentication or environment output was stored.",
+                ],
             }
         ]
         self.assertIs(context_store.validate_state(safe, 17), safe)
@@ -460,6 +502,63 @@ class SchemaTests(unittest.TestCase):
                 with self.assertRaises(context_store.StateValidationError):
                     context_store.validate_state(malformed, 17)
 
+    def test_publish_outcome_controls_approval_authority(self):
+        affirmative = approve_state(state_with_current_changes())
+        self.assertIs(
+            context_store.validate_state(affirmative, 17),
+            affirmative,
+        )
+
+        for outcome, answer in (
+            ("rejected", "Reject this exact packet."),
+            ("changes-requested", "Request changes to this exact packet."),
+        ):
+            with self.subTest(outcome=outcome):
+                state = approve_state(state_with_current_changes())
+                decision = state["decision_history"][0]
+                decision["outcome"] = outcome
+                decision["answer"] = answer
+                state["approval"]["human_answer"] = answer
+                with self.assertRaises(context_store.StateValidationError):
+                    context_store.validate_state(state, 17)
+
+                state["approval"]["valid"] = False
+                self.assertIs(context_store.validate_state(state, 17), state)
+
+    def test_publish_decision_requires_options_and_exact_displayed_answer(self):
+        empty_options = approve_state(state_with_current_changes())
+        empty_options["decision_history"][0]["options"] = []
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(empty_options, 17)
+
+        undisplayed_answer = approve_state(state_with_current_changes())
+        undisplayed_answer["decision_history"][0]["answer"] = "Sure, do it."
+        undisplayed_answer["approval"]["human_answer"] = "Sure, do it."
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(undisplayed_answer, 17)
+
+        wrong_question = approve_state(state_with_current_changes())
+        wrong_question["decision_history"][0]["question"] = (
+            "Can I publish something?"
+        )
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(wrong_question, 17)
+
+    def test_recovery_metadata_is_reserved_for_state_recovery_events(self):
+        state = valid_state()
+        state["decision_history"].append(
+            decision_event(
+                revision=0,
+                recovery={
+                    "backup_name": "state-corrupt.json",
+                    "backup_path": "/tmp/state-corrupt.json",
+                }
+            )
+        )
+
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(state, 17)
+
     def test_valid_approval_cannot_leave_its_publish_decision_pending(self):
         state = approve_state(state_with_current_changes())
         state["pending_decisions"] = [
@@ -535,6 +634,11 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(context_store.StateValidationError):
             context_store.validate_state(missing_approval, 17)
 
+        invalid_approval = json.loads(json.dumps(state))
+        invalid_approval["approval"]["valid"] = False
+        with self.assertRaises(context_store.StateValidationError):
+            context_store.validate_state(invalid_approval, 17)
+
     def test_missing_state_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory, "repo")
@@ -564,8 +668,61 @@ class SchemaTests(unittest.TestCase):
             with self.assertRaises(context_store.StateValidationError):
                 context_store.read_state(repository, 17, runner=runner)
 
+    def test_read_rejects_copied_ledger_with_mismatched_local_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state = valid_state(
+                local_path=str(Path(directory, "other-repository")),
+                workspace_path=str(repository),
+            )
+            state_dir = context_store.state_directory(repository, 17)
+            state_dir.mkdir(parents=True)
+            (state_dir / "state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                context_store.StateValidationError,
+                "local_path",
+            ):
+                context_store.read_state(repository, 17)
+
+    @unittest.skipIf(os.name == "nt", "symlink behavior varies on Windows")
+    def test_read_rejects_dangling_state_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir = context_store.state_directory(repository, 17)
+            state_dir.mkdir(parents=True)
+            (state_dir / "state.json").symlink_to(
+                state_dir / "missing-state.json"
+            )
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.read_state(repository, 17)
+
 
 class MutationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "symlink behavior varies on Windows")
+    def test_initialize_never_replaces_dangling_state_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir = context_store.state_directory(repository, 17)
+            state_dir.mkdir(parents=True)
+            state_path = state_dir / "state.json"
+            target = state_dir / "missing-state.json"
+            state_path.symlink_to(target)
+
+            with self.assertRaises(context_store.ContextStoreError):
+                context_store.initialize_state(
+                    repository,
+                    17,
+                    valid_state(local_path=str(repository)),
+                )
+
+            self.assertTrue(state_path.is_symlink())
+            self.assertEqual(os.readlink(state_path), str(target))
+
     def test_initialize_and_update_are_private_atomic_and_revision_checked(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = create_git_repository(directory)
@@ -725,6 +882,42 @@ class MutationTests(unittest.TestCase):
 
                     unsafe = json.loads(json.dumps(initial))
                     unsafe["revision"] = 1
+                    if field == "head_sha":
+                        second_root = Path(directory, "second-workspace")
+                        second_workspace = create_git_repository(second_root)
+                        subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(second_workspace),
+                                "commit",
+                                "--allow-empty",
+                                "-q",
+                                "-m",
+                                "Moved head",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        replacement = subprocess.run(
+                            [
+                                "git",
+                                "-C",
+                                str(second_workspace),
+                                "rev-parse",
+                                "HEAD",
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.strip()
+                        unsafe["workspace"] = {
+                            "kind": "worktree",
+                            "path": str(second_workspace.resolve()),
+                            "base_sha": replacement,
+                            "head_sha": replacement,
+                        }
                     if field in unsafe["pull_request"]:
                         unsafe["pull_request"][field] = replacement
                     else:
@@ -798,6 +991,333 @@ class MutationTests(unittest.TestCase):
                     context_store.initialize_state(repository, 17, initial)
 
             self.assertFalse(state_path.exists())
+
+
+class FingerprintTests(unittest.TestCase):
+    def create_changed_workspace(self, directory):
+        repository = create_git_repository(directory)
+        (repository / "tracked.txt").write_text("before\n", encoding="utf-8")
+        (repository / "deleted.txt").write_text("delete me\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(repository), "add", "tracked.txt", "deleted.txt"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repository), "commit", "-q", "-m", "Add files"],
+            check=True,
+        )
+        base_sha = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (repository / "tracked.txt").write_text("after\n", encoding="utf-8")
+        (repository / "deleted.txt").unlink()
+        (repository / "untracked.txt").write_bytes(b"\x00new\xff\n")
+        return repository, base_sha
+
+    def compute(self, repository, base_sha, files):
+        return context_store.compute_packet_identity(
+            workspace_path=repository,
+            workspace_kind="worktree",
+            base_sha=base_sha,
+            head_repository="acme/widgets",
+            head_branch="feature/parser",
+            head_sha=base_sha,
+            commit_message="Apply exact review fixes",
+            included_files=files,
+        )
+
+    def test_fingerprint_is_stable_and_covers_tracked_deleted_and_untracked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            files = ["untracked.txt", "tracked.txt", "deleted.txt"]
+
+            first = self.compute(repository, base_sha, files)
+            second = self.compute(repository, base_sha, list(reversed(files)))
+
+            self.assertEqual(first, second)
+            self.assertEqual(
+                first["packet_identity"]["included_files"],
+                sorted(files),
+            )
+            self.assertRegex(
+                first["packet_identity"]["diff_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(first["workspace"]["base_sha"], base_sha)
+            self.assertEqual(first["workspace"]["head_sha"], base_sha)
+
+            def framed(tag, payload):
+                return tag + struct.pack(">Q", len(payload)) + payload
+
+            canonical = bytearray(b"apply-pr-reviews-change-v1\0")
+            for path, base_mode, base_content, work_mode, work_content in (
+                (
+                    b"deleted.txt",
+                    b"100644",
+                    b"delete me\n",
+                    b"missing",
+                    b"",
+                ),
+                (
+                    b"tracked.txt",
+                    b"100644",
+                    b"before\n",
+                    b"100644",
+                    b"after\n",
+                ),
+                (
+                    b"untracked.txt",
+                    b"missing",
+                    b"",
+                    b"100644",
+                    b"\x00new\xff\n",
+                ),
+            ):
+                canonical.extend(framed(b"P", path))
+                canonical.extend(framed(b"M", base_mode))
+                canonical.extend(framed(b"B", base_content))
+                canonical.extend(framed(b"m", work_mode))
+                canonical.extend(framed(b"W", work_content))
+            self.assertEqual(
+                first["packet_identity"]["diff_sha256"],
+                hashlib.sha256(canonical).hexdigest(),
+            )
+
+            old_hash = first["packet_identity"]["diff_sha256"]
+            if os.name != "nt":
+                os.chmod(repository / "tracked.txt", 0o755)
+                mode_changed = self.compute(repository, base_sha, files)
+                self.assertNotEqual(
+                    mode_changed["packet_identity"]["diff_sha256"],
+                    old_hash,
+                )
+                os.chmod(repository / "tracked.txt", 0o644)
+            (repository / "tracked.txt").write_text(
+                "different after\n",
+                encoding="utf-8",
+            )
+            changed = self.compute(repository, base_sha, files)
+            self.assertNotEqual(
+                changed["packet_identity"]["diff_sha256"],
+                old_hash,
+            )
+
+    def test_fingerprint_rejects_unchanged_missing_outside_and_wrong_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, base_sha = self.create_changed_workspace(directory)
+            for files in (
+                ["missing.txt"],
+                ["../outside.txt"],
+            ):
+                with self.subTest(files=files), self.assertRaises(
+                    context_store.StateValidationError
+                ):
+                    self.compute(repository, base_sha, files)
+
+            if os.name != "nt":
+                outside = Path(directory, "outside")
+                outside.mkdir()
+                (outside / "external.txt").write_text(
+                    "outside\n",
+                    encoding="utf-8",
+                )
+                (repository / "linked-directory").symlink_to(
+                    outside,
+                    target_is_directory=True,
+                )
+                with self.assertRaises(context_store.StateValidationError):
+                    self.compute(
+                        repository,
+                        base_sha,
+                        ["linked-directory/external.txt"],
+                    )
+
+            nested = repository / "nested"
+            nested.mkdir()
+            (nested / "new.txt").write_text("nested\n", encoding="utf-8")
+            with self.assertRaises(context_store.StateValidationError):
+                self.compute(nested, base_sha, ["new.txt"])
+
+            (repository / "unchanged.txt").write_text(
+                "same\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "add", "unchanged.txt"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repository), "commit", "-q", "-m", "Same"],
+                check=True,
+            )
+            new_head = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            with self.assertRaises(context_store.StateValidationError):
+                self.compute(repository, new_head, ["unchanged.txt"])
+            with self.assertRaises(context_store.StateValidationError):
+                self.compute(repository, base_sha, ["tracked.txt"])
+
+    def test_read_fails_closed_for_missing_or_mismatched_workspace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state = valid_state(local_path=str(repository))
+            state_dir = context_store.state_directory(repository, 17)
+            state_dir.mkdir(parents=True)
+            state["workspace"]["path"] = str(
+                Path(directory, "missing-workspace").resolve()
+            )
+            (state_dir / "state.json").write_text(
+                json.dumps(state),
+                encoding="utf-8",
+            )
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.read_state(repository, 17)
+
+
+class RecoveryTests(unittest.TestCase):
+    QUESTION = "How should the preserved invalid local state be handled?"
+    ANSWER = (
+        "Authorize moving the invalid state to a named private backup, then "
+        "initialize fresh state."
+    )
+
+    def create_corrupt_state(self, repository, content="{broken"):
+        state_dir = context_store.state_directory(repository, 17)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_path = state_dir / "state.json"
+        state_path.write_text(content, encoding="utf-8")
+        return state_dir, state_path
+
+    def recover(self, repository, backup_name="state-corrupt.json"):
+        return context_store.recover_state(
+            repository,
+            17,
+            backup_name=backup_name,
+            recovery_question=self.QUESTION,
+            human_answer=self.ANSWER,
+        )
+
+    def test_recover_moves_regular_corrupt_state_and_prints_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir, state_path = self.create_corrupt_state(repository)
+
+            result = self.recover(repository)
+
+            backup = state_dir / "state-corrupt.json"
+            self.assertFalse(os.path.lexists(state_path))
+            self.assertEqual(backup.read_text(encoding="utf-8"), "{broken")
+            self.assertEqual(
+                result,
+                {
+                    "backup_name": "state-corrupt.json",
+                    "backup_path": str(backup.resolve()),
+                    "recovery_question": self.QUESTION,
+                    "human_answer": self.ANSWER,
+                },
+            )
+            if os.name != "nt":
+                self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
+
+    @unittest.skipIf(os.name == "nt", "symlink behavior varies on Windows")
+    def test_recover_moves_dangling_symlink_without_following_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir = context_store.state_directory(repository, 17)
+            state_dir.mkdir(parents=True)
+            state_path = state_dir / "state.json"
+            target = state_dir / "missing-target.json"
+            state_path.symlink_to(target)
+
+            self.recover(repository, "dangling-state")
+
+            backup = state_dir / "dangling-state"
+            self.assertFalse(os.path.lexists(state_path))
+            self.assertTrue(backup.is_symlink())
+            self.assertEqual(os.readlink(backup), str(target))
+
+    def test_recover_rejects_unsafe_or_existing_backup_names(self):
+        for backup_name in (
+            "",
+            "../escape",
+            "nested/name",
+            "state.json",
+            ".lock",
+            "recovery.json",
+        ):
+            with self.subTest(backup_name=backup_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    repository = create_git_repository(directory)
+                    _, state_path = self.create_corrupt_state(repository)
+                    with self.assertRaises(
+                        context_store.StateValidationError
+                    ):
+                        self.recover(repository, backup_name)
+                    self.assertTrue(os.path.lexists(state_path))
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir, state_path = self.create_corrupt_state(repository)
+            (state_dir / "existing-backup").write_text(
+                "preserve",
+                encoding="utf-8",
+            )
+            with self.assertRaises(context_store.StateValidationError):
+                self.recover(repository, "existing-backup")
+            self.assertTrue(os.path.lexists(state_path))
+
+    def test_recover_respects_existing_pr_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir, state_path = self.create_corrupt_state(repository)
+            lock_dir = state_dir / ".lock"
+            lock_dir.mkdir()
+            (lock_dir / "owner.json").write_text(
+                '{"pid": 9}',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(context_store.StateLockError):
+                self.recover(repository)
+
+            self.assertTrue(os.path.lexists(state_path))
+
+    def test_fresh_init_after_recovery_requires_exact_first_history_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            self.create_corrupt_state(repository)
+            recovery = self.recover(repository)
+            state = valid_state(local_path=str(repository))
+
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.initialize_state(repository, 17, state)
+
+            state["decision_history"].append(
+                decision_event(
+                    revision=0,
+                    decision_type="state-recovery",
+                    answer=self.ANSWER,
+                    transition="blocked -> evaluate",
+                    question=self.QUESTION,
+                    recovery={
+                        "backup_name": recovery["backup_name"],
+                        "backup_path": recovery["backup_path"],
+                    },
+                )
+            )
+            result = context_store.initialize_state(repository, 17, state)
+            self.assertEqual(
+                result["decision_history"][0]["decision_type"],
+                "state-recovery",
+            )
 
 
 class CliTests(unittest.TestCase):
@@ -896,3 +1416,70 @@ class CliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("revision", stderr.getvalue().lower())
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_fingerprint_cli_prints_packet_and_workspace_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            (repository / "new.txt").write_text("new\n", encoding="utf-8")
+            head_sha = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = context_store.main(
+                    [
+                        "fingerprint",
+                        "--workspace",
+                        str(repository),
+                        "--workspace-kind",
+                        "worktree",
+                        "--base-sha",
+                        head_sha,
+                        "--head-repository",
+                        "acme/widgets",
+                        "--head-branch",
+                        "feature/parser",
+                        "--head-sha",
+                        head_sha,
+                        "--commit-message",
+                        "Add new file",
+                        "--file",
+                        "new.txt",
+                    ]
+                )
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                result["packet_identity"]["included_files"],
+                ["new.txt"],
+            )
+
+    def test_recover_cli_moves_corrupt_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            state_dir = context_store.state_directory(repository, 17)
+            state_dir.mkdir(parents=True)
+            (state_dir / "state.json").write_text("{broken", encoding="utf-8")
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = context_store.main(
+                    [
+                        "recover",
+                        "--repo",
+                        str(repository),
+                        "--pr",
+                        "17",
+                        "--backup-name",
+                        "state-corrupt.json",
+                        "--recovery-question",
+                        RecoveryTests.QUESTION,
+                        "--human-answer",
+                        RecoveryTests.ANSWER,
+                    ]
+                )
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(result["backup_name"], "state-corrupt.json")
