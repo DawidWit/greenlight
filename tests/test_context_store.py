@@ -216,3 +216,149 @@ class SchemaTests(unittest.TestCase):
 
             with self.assertRaises(context_store.StateValidationError):
                 context_store.read_state(repository, 17, runner=runner)
+
+
+class MutationTests(unittest.TestCase):
+    def test_initialize_and_update_are_private_atomic_and_revision_checked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+
+            written = context_store.initialize_state(
+                repository, 17, initial
+            )
+            state_dir = context_store.state_directory(repository, 17)
+            state_path = state_dir / "state.json"
+
+            self.assertEqual(written["revision"], 0)
+            if os.name != "nt":
+                self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(state_dir.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(
+                    state_dir.parent.stat().st_mode & 0o777,
+                    0o700,
+                )
+
+            updated = json.loads(json.dumps(written))
+            updated["revision"] = 1
+            updated["phase"] = "baseline"
+            updated["decision_history"].append(decision_event())
+
+            result = context_store.update_state(
+                repository, 17, 0, updated
+            )
+
+            self.assertEqual(result["revision"], 1)
+            self.assertEqual(
+                context_store.read_state(repository, 17)["phase"],
+                "baseline",
+            )
+            with self.assertRaises(context_store.RevisionConflict):
+                context_store.update_state(repository, 17, 0, updated)
+
+    def test_update_preserves_identity_and_history_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            context_store.initialize_state(repository, 17, initial)
+
+            changed_identity = valid_state(
+                revision=1,
+                local_path=str(repository.resolve()),
+            )
+            changed_identity["repository"]["name_with_owner"] = "other/repo"
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(
+                    repository, 17, 0, changed_identity
+                )
+
+            other_repository = create_git_repository(
+                Path(directory, "second")
+            )
+            initial_with_history = valid_state(
+                local_path=str(other_repository.resolve())
+            )
+            initial_with_history["decision_history"] = [
+                decision_event(revision=0)
+            ]
+            context_store.initialize_state(
+                other_repository, 17, initial_with_history
+            )
+            removed_history = valid_state(
+                revision=1,
+                local_path=str(other_repository.resolve()),
+            )
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(
+                    other_repository, 17, 0, removed_history
+                )
+
+    def test_existing_lock_blocks_update_and_exposes_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            context_store.initialize_state(repository, 17, initial)
+            state_dir = context_store.state_directory(repository, 17)
+            lock_dir = state_dir / ".lock"
+            lock_dir.mkdir()
+            (lock_dir / "owner.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 4242,
+                        "created_at": "2026-07-24T12:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            updated = valid_state(
+                revision=1,
+                local_path=str(repository.resolve()),
+            )
+            with self.assertRaisesRegex(
+                context_store.StateLockError, "4242"
+            ):
+                context_store.update_state(
+                    repository, 17, 0, updated
+                )
+
+    def test_head_change_invalidates_existing_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = create_git_repository(directory)
+            initial = valid_state(local_path=str(repository.resolve()))
+            initial["approval"] = {
+                "valid": True,
+                "head_sha": "a" * 40,
+            }
+            context_store.initialize_state(repository, 17, initial)
+
+            unsafe = valid_state(
+                revision=1,
+                head_sha="b" * 40,
+                local_path=str(repository.resolve()),
+            )
+            unsafe["approval"] = initial["approval"]
+            with self.assertRaises(context_store.StateValidationError):
+                context_store.update_state(repository, 17, 0, unsafe)
+
+            safe = valid_state(
+                revision=1,
+                head_sha="b" * 40,
+                local_path=str(repository.resolve()),
+            )
+            safe["approval"] = {
+                "valid": False,
+                "head_sha": "a" * 40,
+            }
+            safe["decision_history"].append(
+                decision_event(
+                    decision_type="head-sha-invalidated",
+                    answer="Approval invalidated",
+                    transition="approval -> evaluate",
+                )
+            )
+            result = context_store.update_state(
+                repository, 17, 0, safe
+            )
+
+            self.assertFalse(result["approval"]["valid"])

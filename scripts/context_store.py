@@ -2,8 +2,12 @@
 """Persist private per-PR handoff context inside a repository's Git data."""
 
 import json
+import os
 import re
 import subprocess
+import tempfile
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -241,3 +245,171 @@ def read_state(repo_path, pr_number, *, runner=run_command):
     except (OSError, json.JSONDecodeError) as error:
         raise StateValidationError(f"Cannot read valid state: {path}") from error
     return validate_state(state, pr_number)
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _identity(state):
+    return {
+        "repository": state["repository"],
+        "number": state["pull_request"]["number"],
+        "url": state["pull_request"]["url"],
+    }
+
+
+def _validate_repository_path(state, repo_path):
+    configured = Path(
+        state["repository"]["local_path"]
+    ).expanduser().resolve()
+    actual = Path(repo_path).expanduser().resolve()
+    if configured != actual:
+        raise StateValidationError(
+            f"State local_path is {configured}, expected {actual}."
+        )
+
+
+def _set_private_mode(path, mode):
+    try:
+        os.chmod(path, mode)
+    except (NotImplementedError, PermissionError):
+        pass
+
+
+@contextmanager
+def pr_lock(state_dir):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _set_private_mode(state_dir.parent, 0o700)
+    _set_private_mode(state_dir, 0o700)
+    lock_dir = state_dir / ".lock"
+    try:
+        lock_dir.mkdir()
+        _set_private_mode(lock_dir, 0o700)
+    except FileExistsError as error:
+        metadata_path = lock_dir / "owner.json"
+        try:
+            metadata = metadata_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            metadata = "metadata unavailable"
+        raise StateLockError(
+            f"PR state is locked at {lock_dir}: {metadata}"
+        ) from error
+
+    owner_path = lock_dir / "owner.json"
+    try:
+        owner_path.write_text(
+            json.dumps(
+                {"pid": os.getpid(), "created_at": _utc_now()},
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _set_private_mode(owner_path, 0o600)
+        yield
+    finally:
+        try:
+            owner_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            lock_dir.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write(path, state):
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".state.",
+        dir=str(path.parent),
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _set_private_mode(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+        _set_private_mode(path, 0o600)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def initialize_state(repo_path, pr_number, state, *, runner=run_command):
+    validate_state(state, pr_number)
+    _validate_repository_path(state, repo_path)
+    if state["revision"] != 0:
+        raise StateValidationError("Initial state revision must be 0.")
+    state_dir = state_directory(repo_path, pr_number, runner=runner)
+    with pr_lock(state_dir):
+        path = state_dir / STATE_FILENAME
+        if path.exists():
+            raise RevisionConflict(
+                f"State already exists for PR {pr_number}: {path}"
+            )
+        _atomic_write(path, state)
+    return state
+
+
+def update_state(
+    repo_path,
+    pr_number,
+    expected_revision,
+    state,
+    *,
+    runner=run_command,
+):
+    validate_state(state, pr_number)
+    _validate_repository_path(state, repo_path)
+    if state["revision"] != expected_revision + 1:
+        raise RevisionConflict(
+            "New state revision must equal expected revision plus one."
+        )
+    state_dir = state_directory(repo_path, pr_number, runner=runner)
+    with pr_lock(state_dir):
+        current = read_state(repo_path, pr_number, runner=runner)
+        if current is None:
+            raise RevisionConflict(f"State does not exist for PR {pr_number}.")
+        if current["revision"] != expected_revision:
+            raise RevisionConflict(
+                f"Expected revision {expected_revision}, "
+                f"found {current['revision']}."
+            )
+        if _identity(current) != _identity(state):
+            raise StateValidationError(
+                "Repository and PR identity cannot change."
+            )
+        old_history = current["decision_history"]
+        new_history = state["decision_history"]
+        if new_history[: len(old_history)] != old_history:
+            raise StateValidationError(
+                "decision_history must preserve its existing prefix."
+            )
+        old_sha = current["pull_request"]["head_sha"]
+        new_sha = state["pull_request"]["head_sha"]
+        current_approval = current["approval"]
+        if (
+            old_sha != new_sha
+            and isinstance(current_approval, dict)
+            and current_approval.get("valid") is True
+        ):
+            approval = state["approval"]
+            if (
+                not isinstance(approval, dict)
+                or approval.get("valid") is not False
+                or not new_history
+                or new_history[-1]["decision_type"]
+                != "head-sha-invalidated"
+            ):
+                raise StateValidationError(
+                    "A head SHA change must invalidate approval and append "
+                    "a head-sha-invalidated decision."
+                )
+        _atomic_write(state_dir / STATE_FILENAME, state)
+    return state
