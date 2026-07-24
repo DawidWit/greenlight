@@ -1,0 +1,17 @@
+{
+  "name": "greenlight",
+  "description": "Human-gated development workflow skills: agents that prepare verified work and publish only after explicit approval",
+  "version": "0.1.0",
+  "author": {
+    "name": "DawidWit",
+    "email": "135219147+DawidWit@users.noreply.github.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "skills",
+    "code-review",
+    "pull-request",
+    "workflow",
+    "human-in-the-loop"
+  ]
+}

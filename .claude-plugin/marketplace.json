@@ -1,0 +1,20 @@
+{
+  "name": "greenlight-marketplace",
+  "description": "Marketplace for the greenlight skills collection",
+  "owner": {
+    "name": "DawidWit",
+    "email": "135219147+DawidWit@users.noreply.github.com"
+  },
+  "plugins": [
+    {
+      "name": "greenlight",
+      "description": "Human-gated development workflow skills: agents that prepare verified work and publish only after explicit approval",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "DawidWit",
+        "email": "135219147+DawidWit@users.noreply.github.com"
+      }
+    }
+  ]
+}
