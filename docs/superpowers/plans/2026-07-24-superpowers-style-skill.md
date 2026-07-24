@@ -290,18 +290,38 @@ class SchemaTests(unittest.TestCase):
     def test_rejects_environment_and_authentication_keys_recursively(self):
         forbidden_keys = (
             "environment",
+            "environment_variable",
+            "environment-variable",
+            "environment variable",
+            "environmentVariable",
             "environment_variables",
             "environment-variables",
             "environment variables",
             "environmentVariables",
+            "env_variable",
+            "env-variable",
+            "env variable",
+            "envVar",
+            "env_variables",
+            "env-vars",
+            "env variables",
+            "envVars",
             "authentication_output",
             "authentication-output",
             "authentication output",
             "authenticationOutput",
+            "authentication_outputs",
+            "authentication-outputs",
+            "authentication outputs",
+            "authenticationOutputs",
             "auth_output",
             "auth-output",
             "auth output",
             "authOutput",
+            "auth_outputs",
+            "auth-outputs",
+            "auth outputs",
+            "authOutputs",
         )
         for key in forbidden_keys:
             with self.subTest(key=key):
@@ -393,6 +413,10 @@ FORBIDDEN_NORMALIZED_KEYS = {
     "authenticationoutput",
     "authoutput",
 }
+FORBIDDEN_NORMALIZED_PATTERN = re.compile(
+    r"(?:env|environment)(?:var|variable)s?"
+    r"|(?:auth|authentication)outputs?"
+)
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DECISION_FIELDS = {
     "revision",
@@ -493,6 +517,7 @@ def _reject_forbidden_keys(value, path="state"):
             if (
                 FORBIDDEN_KEY.search(key)
                 or normalized_key in FORBIDDEN_NORMALIZED_KEYS
+                or FORBIDDEN_NORMALIZED_PATTERN.fullmatch(normalized_key)
             ):
                 raise StateValidationError(f"Forbidden key at {path}.{key}.")
             _reject_forbidden_keys(nested, f"{path}.{key}")

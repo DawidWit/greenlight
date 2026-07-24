@@ -42,6 +42,10 @@ FORBIDDEN_NORMALIZED_KEYS = {
     "authenticationoutput",
     "authoutput",
 }
+FORBIDDEN_NORMALIZED_PATTERN = re.compile(
+    r"(?:env|environment)(?:var|variable)s?"
+    r"|(?:auth|authentication)outputs?"
+)
 SHA_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 DECISION_FIELDS = {
     "revision",
@@ -142,6 +146,7 @@ def _reject_forbidden_keys(value, path="state"):
             if (
                 FORBIDDEN_KEY.search(key)
                 or normalized_key in FORBIDDEN_NORMALIZED_KEYS
+                or FORBIDDEN_NORMALIZED_PATTERN.fullmatch(normalized_key)
             ):
                 raise StateValidationError(f"Forbidden key at {path}.{key}.")
             _reject_forbidden_keys(nested, f"{path}.{key}")
