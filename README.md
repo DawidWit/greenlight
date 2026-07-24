@@ -19,7 +19,7 @@ pushed, or made irreversible without approval bound to the exact change.
 Add this repository as a plugin marketplace, then install the plugin:
 
 ```
-/plugin marketplace add <path-or-git-url-to-this-repo>
+/plugin marketplace add DawidWit/greenlight
 /plugin install greenlight@greenlight-marketplace
 ```
 
