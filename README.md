@@ -10,9 +10,10 @@ pushed, or made irreversible without approval bound to the exact change.
 
 ## Skills
 
-| Skill                                                  | What it does                                                                                                                                                                                                                                      |
-| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`apply-pr-reviews`](skills/apply-pr-reviews/SKILL.md) | Processes open pull requests authored by the authenticated GitHub user: evaluates review feedback against current code, prepares verified changes in isolated workspaces, persists local handoff context, and publishes only exact approved work. |
+| Skill                                                  | What it does                                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [`apply-pr-reviews`](skills/apply-pr-reviews/SKILL.md) | Processes open pull requests authored by the authenticated GitHub user: evaluates review feedback against current code, prepares verified changes in isolated workspaces, persists local handoff context, and publishes only exact approved work.                                                                  |
+| [`prepare-pr`](skills/prepare-pr/SKILL.md)             | Takes a ticket, a description or existing changes to a pull request: asks one short question at a time, routes behavior questions to the PO, slices work into small stacked PRs, checks the plan against the repository rules, implements test-first, verifies, reviews, and publishes only after an explicit yes. |
 
 ## Install
 
@@ -41,6 +42,17 @@ Run a skill's tests from its own directory:
 cd skills/apply-pr-reviews
 python3 -m unittest discover tests
 ```
+
+Run the tests of every skill:
+
+```
+for dir in skills/*/; do (cd "$dir" && python3 -m unittest discover tests) || exit 1; done
+```
+
+## Third-party notices
+
+Some skills adapt text from other MIT-licensed projects. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 

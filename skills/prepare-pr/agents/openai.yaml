@@ -1,0 +1,4 @@
+interface:
+  display_name: "Prepare PR"
+  short_description: "Take a ticket or existing changes to an approved PR"
+  default_prompt: "Use $prepare-pr to take this ticket to a pull request."
