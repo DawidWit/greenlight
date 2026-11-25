@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Configure local repositories and collect GitHub PR review data read-only."""
+"""Configure local repositories and collect GitHub PR data read-only.
+
+Collects review surfaces, CI and merge state, stacked PRs, and merged parents.
+"""
 
 import argparse
 import json
@@ -12,6 +15,7 @@ from pathlib import Path
 
 
 CONFIG_VERSION = 1
+OUTPUT_VERSION = 2
 CONFIG_DIRECTORY = "apply-pr-reviews"
 CONFIG_FILENAME = "repositories.json"
 PR_LIST_FIELDS = (
@@ -21,8 +25,10 @@ PR_LIST_FIELDS = (
 PR_DETAIL_FIELDS = (
     "number,title,url,body,headRefName,headRefOid,headRepository,"
     "headRepositoryOwner,baseRefName,baseRefOid,isCrossRepository,isDraft,"
-    "reviewDecision,statusCheckRollup,files,commits"
+    "reviewDecision,statusCheckRollup,commits,mergeable,mergeStateStatus"
 )
+MERGED_PR_FIELDS = "number,headRefName,headRefOid,baseRefName"
+MERGED_PR_LIMIT = "100"
 
 REVIEW_THREADS_QUERY = """
 query(
@@ -267,6 +273,162 @@ def list_open_prs(repository, *, runner=run_command):
     return result
 
 
+def fetch_viewer_login(*, runner=run_command):
+    """Return the login of the authenticated GitHub user."""
+    login = runner(["gh", "api", "user", "--jq", ".login"], cwd=None).strip()
+    if not login:
+        raise ExternalCommandError("Cannot read the authenticated GitHub login.")
+    return login
+
+
+def list_merged_prs(repository, *, runner=run_command):
+    """List recently merged PRs authored by the authenticated GitHub user."""
+    command = [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        repository,
+        "--author",
+        "@me",
+        "--state",
+        "merged",
+        "--limit",
+        MERGED_PR_LIMIT,
+        "--json",
+        MERGED_PR_FIELDS,
+    ]
+    result = run_json(command, runner=runner)
+    if not isinstance(result, list):
+        raise ExternalCommandError(
+            f"Unexpected merged PR list response for {repository}."
+        )
+    return result
+
+
+def _last_comment_author(thread):
+    nodes = (thread.get("comments") or {}).get("nodes") or []
+    if not nodes:
+        return None
+    return (nodes[-1].get("author") or {}).get("login")
+
+
+def mark_awaiting_reviewer(threads, viewer):
+    """Mark threads whose last comment was written by the viewer."""
+    viewer_key = viewer.lower()
+    marked = []
+    for thread in threads:
+        author = _last_comment_author(thread)
+        marked.append(
+            {
+                **thread,
+                "awaiting_reviewer": author is not None
+                and author.lower() == viewer_key,
+            }
+        )
+    return marked
+
+
+def _commit_oids(pull_request):
+    commits = (pull_request.get("details") or {}).get("commits") or []
+    return [commit.get("oid") for commit in commits]
+
+
+def annotate_stacks(pull_requests, merged_prs):
+    """Link stacked PRs and merged parents; order every parent first."""
+    open_by_head = {}
+    for pull_request in pull_requests:
+        open_by_head.setdefault(pull_request["headRefName"], pull_request)
+    merged_by_head_oid = {}
+    for merged in merged_prs:
+        merged_by_head_oid.setdefault(merged["headRefOid"], merged)
+    integration_branches = {merged["baseRefName"] for merged in merged_prs}
+
+    def parent_of(pull_request):
+        return open_by_head.get(pull_request.get("baseRefName"))
+
+    def merged_parent_by_base(pull_request):
+        base = pull_request.get("baseRefName")
+        merged = merged_by_head_oid.get(
+            (pull_request.get("details") or {}).get("baseRefOid")
+        )
+        if (
+            merged is None
+            or merged["headRefName"] != base
+            or base in integration_branches
+        ):
+            return None
+        return merged
+
+    def merged_parent_by_commits(pull_request):
+        return next(
+            (
+                merged_by_head_oid[oid]
+                for oid in reversed(_commit_oids(pull_request))
+                if oid in merged_by_head_oid
+                and merged_by_head_oid[oid]["baseRefName"]
+                == pull_request.get("baseRefName")
+            ),
+            None,
+        )
+
+    def merged_parent_of(pull_request):
+        merged = merged_parent_by_base(
+            pull_request
+        ) or merged_parent_by_commits(pull_request)
+        if merged is None:
+            return None
+        return {
+            "number": merged["number"],
+            "head_oid": merged["headRefOid"],
+            "base_branch": merged["baseRefName"],
+        }
+
+    def chain_to_root(pull_request):
+        chain = [pull_request]
+        seen = {pull_request["number"]}
+        parent = parent_of(pull_request)
+        while parent is not None:
+            if parent["number"] in seen:
+                raise CollectReviewsError(
+                    "Stack cycle between pull requests: "
+                    + ", ".join(f"#{number}" for number in sorted(seen))
+                )
+            seen.add(parent["number"])
+            chain.append(parent)
+            parent = parent_of(parent)
+        return chain
+
+    input_index = {
+        pull_request["number"]: index
+        for index, pull_request in enumerate(pull_requests)
+    }
+    annotated = []
+    for pull_request in pull_requests:
+        chain = chain_to_root(pull_request)
+        parent = parent_of(pull_request)
+        annotated.append(
+            (
+                (input_index[chain[-1]["number"]], len(chain) - 1),
+                {
+                    **pull_request,
+                    "stack": {
+                        "parent": None if parent is None else parent["number"],
+                        "merged_parent": None
+                        if parent is not None
+                        else merged_parent_of(pull_request),
+                        "shared_head": pull_request["headRefName"]
+                        in integration_branches,
+                    },
+                },
+            )
+        )
+    return [
+        pull_request
+        for _, pull_request in sorted(annotated, key=lambda item: item[0])
+    ]
+
+
 def _repository_parts(repository):
     try:
         owner, name = repository.split("/", 1)
@@ -351,21 +513,6 @@ def fetch_reviews(repository, number, *, runner=run_command):
     return _flatten_pages(value, context=f"{repository}#{number} reviews")
 
 
-def fetch_inline_comments(repository, number, *, runner=run_command):
-    """Fetch every inline review comment, including long thread replies."""
-    command = [
-        "gh",
-        "api",
-        "--paginate",
-        "--slurp",
-        f"repos/{repository}/pulls/{number}/comments",
-    ]
-    value = run_json(command, runner=runner)
-    return _flatten_pages(
-        value, context=f"{repository}#{number} inline comments"
-    )
-
-
 def fetch_issue_comments(repository, number, *, runner=run_command):
     """Fetch pull-request conversation comments."""
     command = [
@@ -399,8 +546,8 @@ def fetch_pr_details(repository, number, *, runner=run_command):
     return value
 
 
-def collect_repository(entry, *, runner=run_command):
-    """Collect every review surface for one configured repository."""
+def collect_repository(entry, *, viewer, runner=run_command):
+    """Collect review surfaces, merge state, and stacks for one repository."""
     repository = entry["repository"]
     pull_requests = []
     for pull_request in list_open_prs(repository, runner=runner):
@@ -408,11 +555,9 @@ def collect_repository(entry, *, runner=run_command):
         pull_requests.append(
             {
                 **pull_request,
-                "review_threads": fetch_review_threads(
-                    repository, number, runner=runner
-                ),
-                "inline_comments": fetch_inline_comments(
-                    repository, number, runner=runner
+                "review_threads": mark_awaiting_reviewer(
+                    fetch_review_threads(repository, number, runner=runner),
+                    viewer,
                 ),
                 "reviews": fetch_reviews(repository, number, runner=runner),
                 "issue_comments": fetch_issue_comments(
@@ -422,6 +567,10 @@ def collect_repository(entry, *, runner=run_command):
                     repository, number, runner=runner
                 ),
             }
+        )
+    if pull_requests:
+        pull_requests = annotate_stacks(
+            pull_requests, list_merged_prs(repository, runner=runner)
         )
     return {
         "path": entry["path"],
@@ -433,10 +582,13 @@ def collect_repository(entry, *, runner=run_command):
 def collect_from_config(path, *, runner=run_command):
     """Collect review data for every configured repository."""
     config = load_config(path)
+    viewer = fetch_viewer_login(runner=runner)
     repositories = []
     for entry in config["repositories"]:
         try:
-            repositories.append(collect_repository(entry, runner=runner))
+            repositories.append(
+                collect_repository(entry, viewer=viewer, runner=runner)
+            )
         except CollectReviewsError as error:
             repositories.append(
                 {
@@ -447,7 +599,8 @@ def collect_from_config(path, *, runner=run_command):
                 }
             )
     return {
-        "version": 1,
+        "version": OUTPUT_VERSION,
+        "viewer": viewer,
         "repositories": repositories,
     }
 
