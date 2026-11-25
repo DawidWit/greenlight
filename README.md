@@ -14,6 +14,7 @@ pushed, or made irreversible without approval bound to the exact change.
 | ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`apply-pr-reviews`](skills/apply-pr-reviews/SKILL.md) | Goes through all of your open pull requests, typically in the morning: fixes review feedback that holds up against the current code, fixes CI failures the code causes, rebases conflicting branches and stacks, then shows one short report and pushes with an exact lease and replies on GitHub after a single yes. |
 | [`prepare-pr`](skills/prepare-pr/SKILL.md)             | Takes a ticket, a description or existing changes to a pull request: asks one short question at a time, routes behavior questions to the PO, slices work into small stacked PRs, checks the plan against the repository rules, implements test-first, verifies, reviews, and publishes only after an explicit yes.    |
+| [`review-prs`](skills/review-prs/SKILL.md)             | Reviews pull requests that wait for your review: checks each one for bugs, repository rules and the ticket, shows a readable numbered list of errors with a short reason, and posts only the comments you pick and confirm, always as a Comment review.                                                               |
 
 ## Install
 

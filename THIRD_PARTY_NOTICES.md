@@ -37,8 +37,9 @@ SOFTWARE.
 
 Source: https://github.com/mattpocock/skills
 
-Used in: `skills/prepare-pr/references/slicing.md` (adapted from `to-issues`)
-and `skills/prepare-pr/references/reviewing.md` (adapted from `review`).
+Used in: `skills/prepare-pr/references/slicing.md` (adapted from `to-issues`),
+`skills/prepare-pr/references/reviewing.md` and
+`skills/review-prs/references/reviewing.md` (adapted from `review`).
 
 ```text
 MIT License

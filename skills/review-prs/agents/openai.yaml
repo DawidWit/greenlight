@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review PRs"
+  short_description: "Review pull requests waiting for you, post only what you confirm"
+  default_prompt: "Use $review-prs to review the pull requests waiting for me."
