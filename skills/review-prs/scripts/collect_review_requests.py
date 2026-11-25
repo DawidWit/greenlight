@@ -297,11 +297,23 @@ def _gh_pr_list(repository, extra, fields, *, runner, state="open"):
     return result
 
 
+def is_bot_author(pull_request):
+    """Tell whether a PR comes from an automation account."""
+    author = pull_request.get("author") or {}
+    login = author.get("login") or ""
+    return (
+        author.get("is_bot") is True
+        or login.startswith("app/")
+        or login.endswith("[bot]")
+    )
+
+
 def list_review_requests(repository, *, runner=run_command):
-    """List open, non-draft PRs that request the user's review."""
-    return _gh_pr_list(
+    """List open, non-draft PRs from people that request the user's review."""
+    requests = _gh_pr_list(
         repository, ["--search", REQUEST_SEARCH], REQUEST_FIELDS, runner=runner
     )
+    return [request for request in requests if not is_bot_author(request)]
 
 
 def list_open_pr_titles(repository, *, runner=run_command):

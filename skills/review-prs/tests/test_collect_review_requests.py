@@ -185,6 +185,19 @@ class ReviewRequestTests(unittest.TestCase):
         for expected in ("--repo", "acme/widgets", "--state", "open"):
             self.assertIn(expected, command)
 
+    def test_list_review_requests_skips_bot_authors(self):
+        requests = [
+            {"number": 1, "author": {"login": "app/renovate", "is_bot": True}},
+            {"number": 2, "author": {"login": "dependabot[bot]", "is_bot": False}},
+            {"number": 3, "author": {"login": "app/github-actions"}},
+            {"number": 4, "author": {"login": "ola", "is_bot": False}},
+        ]
+        runner = RecordingRunner([json.dumps(requests)])
+
+        result = collect.list_review_requests("acme/widgets", runner=runner)
+
+        self.assertEqual([pr["number"] for pr in result], [4])
+
     def test_ticket_keys_are_unique_and_ordered(self):
         self.assertEqual(
             collect.ticket_keys("feat(SHOP-12): x SHOP-12 OPS-3"),

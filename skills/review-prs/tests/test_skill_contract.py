@@ -88,7 +88,7 @@ class SkillContractTests(unittest.TestCase):
     def test_forbidden_github_writes(self):
         self.assert_phrases(
             (
-                "Never approve, request changes, merge or close pull requests, "
+                "Never request changes, merge or close pull requests, "
                 "resolve threads, request reviews, push to the author's "
                 "branch, or re-run CI.",
             )
@@ -136,6 +136,19 @@ class SkillContractTests(unittest.TestCase):
                 "Any non-zero exit",
             )
         )
+
+    def test_approve_only_on_the_users_exact_word(self):
+        self.assert_phrases(
+            (
+                "Approve a PR only when the user's own message names it by "
+                "number and says to approve it",
+                "gh pr review <number> --repo <owner/repo> --approve",
+                "Never offer Approve",
+            )
+        )
+
+    def test_bot_pull_requests_are_skipped(self):
+        self.assert_phrases(("Pull requests from bots are skipped",))
 
     def test_is_concise(self):
         self.assertLessEqual(len(self.raw_skill.splitlines()), MAX_SKILL_LINES)

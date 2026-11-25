@@ -21,7 +21,8 @@ python3 <skill-directory>/scripts/collect_review_requests.py collect > <output-f
 ```
 
 Without options it collects open, non-draft PRs that request the user's
-review, directly or through a team. When the user names PRs, collect only
+review, directly or through a team. Pull requests from bots are skipped
+(Renovate, Dependabot and any other `app/...` or `...[bot]` author). When the user names PRs, collect only
 those, requested or not, with `collect --pr <owner/repo>#<number>` (repeat
 `--pr` for each). GitHub drops the review request after a review, so a named
 PR is the usual way to review a PR again.

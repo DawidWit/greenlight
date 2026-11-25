@@ -11,8 +11,9 @@ Collect the pull requests that wait for the user's review in the configured
 repositories. Review each one on three axes: bugs, repository rules and the
 ticket. Show a readable, numbered list of errors, each with a short reason.
 Post only the comments the user picks and confirms, as one review per pull
-request with event=COMMENT. The verdict (Approve or Request changes) is always
-the user's own click.
+request with event=COMMENT. Approve only on the user's exact word
+([references/commenting.md](references/commenting.md)); never Request changes.
+Pull requests from bots are skipped.
 
 Talk to the user in the user's language: the list and the questions. Comments
 on GitHub are in English.
@@ -27,7 +28,7 @@ Requires Python 3.9+, Git and an authenticated GitHub CLI (`gh`).
 ## Core Principle
 
 **Find real problems with evidence. Show them readably. Post only what the
-user picks and confirms. The verdict is the user's click.**
+user picks and confirms. Approve only on the user's exact word.**
 
 ## The Iron Law
 
@@ -78,7 +79,7 @@ Ask one question at a time and wait for the answer.
 Use it for: missing repository configuration, the first question (which errors)
 and the second question (post these texts).
 
-Do not use it for: a verdict (never offered), routine review choices, or
+Do not use it for: offering Approve (never offered), routine review choices, or
 whether an error belongs on the list (decide it with the evidence rule).
 
 ## Common Rationalizations
@@ -87,9 +88,9 @@ whether an error belongs on the list (decide it with the evidence rule).
 | ----------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | "The user said: post the comments right away."  | They had not seen the list. Show the list, then the texts. Only a yes to the texts posts. |
 | "The user picked the numbers, that is enough."  | The texts go out under their name. Show the exact texts and ask again.                    |
-| "The user asked me to approve."                 | Approve is the user's click. Say so in one line and post only the comments.               |
-| "A blocking bug deserves Request changes."      | The skill posts event=COMMENT only. The user picks the verdict.                           |
-| "I'll offer to approve the clean PR."           | Never offer a verdict. A clean PR gets `🟢 No errors.`                                    |
+| "The user said: and approve it."                | Without the PR number, ask one question that names the PR. Approve only after that.       |
+| "A blocking bug deserves Request changes."      | Comments use event=COMMENT only. Request changes is always the user's click.              |
+| "I'll offer to approve the clean PR."           | Never offer Approve. A clean PR gets `🟢 No errors.`                                      |
 | "A TLDR and headings make it clearer."          | The list is the summary. Use the template, nothing else.                                  |
 | "I'll mention the style nit too."               | Only errors with evidence. Tools catch formatting and types.                              |
 | "Another reviewer wrote it, I'll add my voice." | An error already in an open thread is not on the list.                                    |
@@ -109,12 +110,15 @@ whether an error belongs on the list (decide it with the evidence rule).
 | User picks numbers                             | Show the exact comment texts, ask again           |
 | User says yes to the texts                     | One review per PR, event=COMMENT                  |
 | Comment on a line outside the diff             | In the review body as `path:line`                 |
-| User asks to approve or request changes        | One line: the user clicks it                      |
+| User says "approve #<number>"                  | Head check, then `gh pr review --approve`         |
+| User asks to approve without a PR number       | One question that names the PR                    |
+| User asks to request changes                   | One line: the user clicks it                      |
 
 ## Red Flags - STOP
 
 - Any GitHub write before a yes to the comment texts
-- `event` other than `COMMENT`, or `gh pr review --approve` / `--request-changes`
+- `event` other than `COMMENT` in a comment review, or `--request-changes`
+- Approve without the user's message naming that PR number
 - Offering Approve or Request changes
 - A list with a TLDR, headings, letters instead of numbers, or process narration
 - An error without evidence, or a formatting nit
@@ -135,5 +139,5 @@ whether an error belongs on the list (decide it with the evidence rule).
 
 ## The Bottom Line
 
-**Real errors, short reasons, readable list. Two questions. Comments only. The
-user clicks the verdict.**
+**Real errors, short reasons, readable list. Two questions. Comments as
+event=COMMENT. Approve only on the user's exact word.**

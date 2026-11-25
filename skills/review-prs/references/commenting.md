@@ -86,9 +86,27 @@ event=COMMENT: one review per PR with all its picked comments.
 4. After posting, show one line per PR, for example
    `#270: 2 comments posted - <review url>`, plus every error.
 
+## Approve
+
+Approve a PR only when the user's own message names it by number and says to
+approve it, for example "approve #2894" or "daj approve na #2894". A request
+without a PR number ("approve it", "approve all") gets one question that names
+each PR, and the approve waits for the answer. Never offer Approve, and never
+approve a PR from an earlier message or an earlier run.
+
+1. Check that the PR head is still the `headRefOid` you reviewed. If it moved,
+   do not approve: review the PR again and show its list again.
+2. Approve with no text:
+
+   ```text
+   gh pr review <number> --repo <owner/repo> --approve
+   ```
+
+3. Show one line, for example `#2894: approved - <PR url>`.
+
 ## Never
 
-Never approve, request changes, merge or close pull requests, resolve threads,
-request reviews, push to the author's branch, or re-run CI. When the user asks
-for Approve or Request changes, answer in one line that it is their click, with
-the PR link, and post only the comments.
+Never request changes, merge or close pull requests, resolve threads, request
+reviews, push to the author's branch, or re-run CI. When the user asks for
+Request changes, answer in one line that it is their click, with the PR link,
+and post only the comments.
