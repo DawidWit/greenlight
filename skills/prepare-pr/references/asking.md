@@ -37,12 +37,17 @@ Ask the next question only after the answer to this one.
 
 Collect the "what it must do" points into one message the user forwards to the PO. Write it in the user's language and in plain words, with no code names:
 
-```text
-MESSAGE FOR THE PO
-<one sentence: what we are building>
-1. <question>
-2. <question, only if needed - at most 3>
-<one sentence: what waits for the answer>
+Send it as chat text, never in a code block. Markdown source:
+
+```markdown
+**MESSAGE FOR THE PO**
+
+> <one sentence: what we are building>
+>
+> 1. <question>
+> 2. <question, only if needed - at most 3>
+>
+> <one sentence: what waits for the answer>
 ```
 
 Then continue without the answer:

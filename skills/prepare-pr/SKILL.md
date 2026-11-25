@@ -15,6 +15,10 @@ after an explicit yes.
 Talk to the user in the user's language: questions, summaries and the message
 for the PO.
 
+Show every summary and question as chat text (Markdown). Never put a report, a
+summary or a question in a code block. The templates in this skill are the
+Markdown source to send.
+
 ## Core Principle
 
 **Ask instead of guessing. Obey the repository rules. Build it well. Publish
@@ -76,16 +80,17 @@ One run takes one slice to an open PR. Then ask whether to start the next one.
 
 Every question to the user has this shape:
 
-```text
-QUESTION: <one short sentence>
-Recommendation: <option> - <one-clause reason>
-Options:
+```markdown
+**QUESTION:** <one short sentence>
+
+**Recommendation:** <option> - <one-clause reason>
+
 1. <option>
 2. <option>
 ```
 
-Write `Recommendation` and `Options` only when the options can be named. Ask
-one question at a time and wait for the answer. Keep working on what the
+Write the recommendation and the options only when the options can be named.
+Ask one question at a time and wait for the answer. Keep working on what the
 question does not block.
 
 Use the gate for: how to build something, a rule that collides with the

@@ -160,6 +160,12 @@ class SkillContractTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, self.all_text)
 
+    def test_messages_are_chat_text_not_code_blocks(self):
+        self.assertIn(
+            "Never put a report, a summary or a question in a code block.",
+            self.skill,
+        )
+
     def test_review_focus_rules(self):
         for phrase in (
             "git worktree",

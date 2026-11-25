@@ -16,6 +16,10 @@ and write on GitHub only after the yes.
 Talk to the user in the user's language: questions and the report. Everything
 written on GitHub (commits, replies) is in English.
 
+Show the report and every question as chat text (Markdown). Never put a
+report, a summary or a question in a code block. The templates in this skill
+are the Markdown source to send.
+
 Requires Python 3.9+, Git and an authenticated GitHub CLI (`gh`).
 `<skill-directory>` is the directory of this file.
 
@@ -56,23 +60,24 @@ If anything changed after the report, show a new report and ask again.
    with the exact lease, then replies, after the yes only.
 
 Except for missing configuration, do not ask anything before step 3. A PR
-higher in a stack is worked on only
-after the PR below it is final, so no SHA changes after the report.
+higher in a stack is worked on only after the PR below it is final, so no SHA
+changes after the report.
 
 ## Human Decision Gate
 
 Every question to the user has this shape:
 
-```text
-QUESTION: <one short sentence>
-Recommendation: <option> - <one-clause reason>
-Options:
+```markdown
+**QUESTION:** <one short sentence>
+
+**Recommendation:** <option> - <one-clause reason>
+
 1. <option>
 2. <option>
 ```
 
-Write `Recommendation` and `Options` only when the options can be named. Ask
-one question at a time and wait for the answer.
+Write the recommendation and the options only when the options can be named.
+Ask one question at a time and wait for the answer.
 
 Use it for: a comment that is unclear, conflicts with another comment or
 changes the architecture; a rebase conflict without a clear resolution;

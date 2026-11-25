@@ -11,21 +11,25 @@ A failure caused by your change: fix it and verify again. A failure that existed
 
 ## The summary
 
-When verification and review are done, show this summary and stop:
+When verification and review are done, show this summary and stop. It is
+Markdown source, sent as chat text: never wrap it in a code block.
 
-```text
-READY TO PUBLISH
-Branch: <branch> -> <target branch>
-Changes: <path> +<added>/-<removed>, one line per file
-Verification: <command> -> <result>, one line per check
-Review: Standards <result>, Scope <result>
-Rules: <rules that changed the plan or code, or "no rules found">
-Commit and PR title: <title>
-PR body: <first lines>
-Later: <items, or "none">
-Waiting for PO: <questions, or "none">
+```markdown
+**READY TO PUBLISH**
 
-QUESTION: Publish?
+- **Branch:** `<branch>` -> `<target branch>`
+- **Changes:**
+  - `<path>` +<added>/-<removed> (one line per file)
+- **Verification:**
+  - `<command>` -> <result> (one line per check)
+- **Review:** Standards <result>, Scope <result>
+- **Rules:** <rules that changed the plan or code, or "no rules found">
+- **Commit and PR title:** `<title>`
+- **PR body:** <first lines>
+- **Later:** <items, or "none">
+- **Waiting for PO:** <questions, or "none">
+
+**QUESTION:** Publish?
 ```
 
 ## Titles and body

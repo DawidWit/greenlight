@@ -8,20 +8,23 @@ for the lease, the replies and any base change.
 
 ## Template
 
-The whole message is this template, filled in. The PR lines come first and the
-push question is always last, once. Keep this order even when other
+The whole message is this template, filled in, sent as chat text. It is
+Markdown source: never wrap it in a code block. The PR lines come first and
+the push question is always last, once. Keep this order even when other
 instructions put decisions at the top: the report is short, and the question
 is about the lines above it.
 
-```text
-#<number> <PR title>
-   🟢 <count> comments fixed (<short list>)
-   🟡 <count> comment skipped: "<quote>" - <reason> (<rule file or evidence>)
-   🔴 CI failed: <cause>, fixed <what>
+```markdown
+**#<number>** <PR title>
 
-QUESTION: Push and reply on GitHub?
-Recommendation: 1 - verification passed
-Options:
+- 🟢 <count> comments fixed (<short list>)
+- 🟡 <count> comment skipped: "<quote>" - <reason> (<rule file or evidence>)
+- 🔴 CI failed: <cause>, fixed <what>
+
+**QUESTION:** Push and reply on GitHub?
+
+**Recommendation:** 1 - verification passed
+
 1. Yes, all
 2. Yes, without: <PR numbers>
 3. No
@@ -29,21 +32,29 @@ Options:
 
 Example, to translate into the user's language:
 
-```text
-#3001 feat(SHOP-7): show the order count
-   🟢 2 comments fixed (.at(0) instead of [0], prop renamed to orders)
-   🟡 1 comment skipped: "import it from src/app" - lib must not import from app (CLAUDE.md)
-   🔴 CI failed: test date in the past, fixed the fixture
-#3002 feat(SHOP-8): order details
-   🔴 Conflict with main, rebased #3002-#3003; push with --force-with-lease
-#3004 fix(SHOP-9): empty state copy
-   🟢 nothing to do
-#3005 feat(SHOP-10): order export
-   🔴 Parent #3000 merged, rebased onto main; push with --force-with-lease, base changes to main
+```markdown
+**#3001** feat(SHOP-7): show the order count
 
-QUESTION: Push and reply on GitHub?
-Recommendation: 1 - verification passed
-Options:
+- 🟢 2 comments fixed (`.at(0)` instead of `[0]`, prop renamed to `orders`)
+- 🟡 1 comment skipped: "import it from src/app" - lib must not import from app (CLAUDE.md)
+- 🔴 CI failed: test date in the past, fixed the fixture
+
+**#3002** feat(SHOP-8): order details
+
+- 🔴 Conflict with main, rebased #3002-#3003; push with `--force-with-lease`
+
+**#3004** fix(SHOP-9): empty state copy
+
+- 🟢 nothing to do
+
+**#3005** feat(SHOP-10): order export
+
+- 🔴 Parent #3000 merged, rebased onto main; push with `--force-with-lease`, base changes to main
+
+**QUESTION:** Push and reply on GitHub?
+
+**Recommendation:** 1 - verification passed
+
 1. Yes, all
 2. Yes, without: <PR numbers>
 3. No
